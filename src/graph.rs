@@ -74,6 +74,7 @@ pub struct RspFile {
 }
 
 /// Input files to a Build.
+#[derive(Debug)]
 pub struct BuildIns {
     /// Internally we stuff explicit/implicit/order-only ins all into one Vec.
     /// This is mostly to simplify some of the iteration and is a little more
@@ -88,6 +89,7 @@ pub struct BuildIns {
 }
 
 /// Output files from a Build.
+#[derive(Debug)]
 pub struct BuildOuts {
     /// Similar to ins, we keep both explicit and implicit outs in one Vec.
     pub ids: Vec<FileId>,
@@ -145,6 +147,7 @@ mod tests {
 }
 
 /// A single build action, generating File outputs from File inputs with a command.
+#[derive(Debug)]
 pub struct Build {
     /// Source location this Build was declared.
     pub location: FileLoc,
@@ -249,7 +252,7 @@ impl Build {
 }
 
 /// The build graph: owns Files/Builds and maps FileIds/BuildIds to them.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Graph {
     pub builds: DenseMap<BuildId, Build>,
     pub files: GraphFiles,
@@ -257,13 +260,30 @@ pub struct Graph {
 
 /// Files identified by FileId, as well as mapping string filenames to them.
 /// Split from Graph for lifetime reasons.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct GraphFiles {
     pub by_id: DenseMap<FileId, File>,
     by_name: FxHashMap<String, FileId>,
 }
 
 impl Graph {
+    pub fn get_start_nodes(&self) -> Vec<FileId> {
+        use std::collections::HashSet;
+        let mut starts = vec![];
+        let n = self.files.by_name.len() as u32;
+        for i in 0..n {
+            let fid = FileId(i);
+            starts.push(fid);
+        }
+        let mut starts: HashSet<FileId> = starts.into_iter().collect();
+        for build in self.builds.iter() {
+            for fid in build.ins.ids.iter() {
+                starts.remove(fid);
+            }
+        }
+        starts.into_iter().collect()
+    }
+
     /// Look up a file by its FileId.
     pub fn file(&self, id: FileId) -> &File {
         &self.files.by_id[id]
@@ -384,7 +404,7 @@ impl FileState {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Hashes(HashMap<BuildId, BuildHash>);
 
 impl Hashes {

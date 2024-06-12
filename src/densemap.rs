@@ -8,6 +8,7 @@ pub trait Index: From<usize> {
 
 /// A map of a dense integer key to value, implemented as a vector.
 /// Effectively wraps Vec<V> to provided typed keys.
+#[derive(Debug)]
 pub struct DenseMap<K, V> {
     vec: Vec<V>,
     key_type: std::marker::PhantomData<K>,
@@ -49,6 +50,10 @@ impl<K: Index, V> DenseMap<K, V> {
         let id = self.next_id();
         self.vec.push(val);
         id
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<V> {
+        self.vec.iter()
     }
 }
 

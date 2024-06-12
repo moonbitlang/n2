@@ -7,6 +7,8 @@ use crate::{
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use std::sync::{Arc, Mutex};
+
 /// Build steps go through this sequence of states.
 /// See "Build states" in the design notes.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -667,8 +669,15 @@ impl<'a> Work<'a> {
     /// Runs the build.
     /// Returns the number of tasks executed on successful builds, or None on failed builds.
     pub fn run(&mut self) -> anyhow::Result<Option<usize>> {
-        #[cfg(unix)]
-        signal::register_sigint();
+        self.run_with_logger(None)
+    }
+
+    pub fn run_with_logger(
+        &mut self,
+        logger: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+    ) -> anyhow::Result<Option<usize>> {
+        // #[cfg(unix)]
+        // signal::register_sigint();
         let mut tasks_done = 0;
         let mut tasks_failed = 0;
         let mut runner = task::Runner::new(self.options.parallelism);
@@ -732,9 +741,21 @@ impl<'a> Work<'a> {
                 panic!("BUG: no work to do and runner not running");
             }
 
-            let task = runner.wait(|id, line| {
-                self.progress.task_output(id, line);
-            });
+            let task = if logger.is_none() {
+                runner.wait(|id, line| {
+                    self.progress.task_output(id, line);
+                })
+            } else {
+                let logger = logger.as_ref().unwrap();
+                runner.wait(|id, line| {
+                    let mut logger = logger.lock().unwrap();
+                    if let Some(cmd) = &self.graph.builds[id].cmdline {
+                        logger.push(cmd.as_bytes().into());
+                    }
+                    logger.push(line.clone());
+                    self.progress.task_output(id, line);
+                })
+            };
             let build = &self.graph.builds[task.buildid];
             trace::if_enabled(|t| {
                 let desc = progress::build_message(build);

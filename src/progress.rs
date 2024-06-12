@@ -5,6 +5,7 @@ use crate::{
     graph::Build, graph::BuildId, process::Termination, task::TaskResult, terminal,
     work::BuildState, work::StateCounts,
 };
+use colored::*;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
@@ -41,6 +42,7 @@ pub trait Progress {
     /// used when a task fails; we want the final output to show that failed
     /// task's output even if we do more work after it fails.
     fn log(&mut self, msg: &str);
+    fn log_ignore_quiet(&mut self, msg: &str);
 }
 
 /// Currently running build task, as tracked for progress updates.
@@ -63,13 +65,15 @@ pub struct DumbConsoleProgress {
     /// The id of the last command printed, used to avoid printing it twice
     /// when we have two updates from the same command in a row.
     last_started: Option<BuildId>,
+    quiet: bool,
 }
 
 impl DumbConsoleProgress {
-    pub fn new(verbose: bool) -> Self {
+    pub fn new(verbose: bool, quiet: bool) -> Self {
         Self {
             verbose,
             last_started: None,
+            quiet,
         }
     }
 }
@@ -101,8 +105,14 @@ impl Progress for DumbConsoleProgress {
                     self.log(build_message(build))
                 }
             }
-            Termination::Interrupted => self.log(&format!("interrupted: {}", build_message(build))),
-            Termination::Failure => self.log(&format!("failed: {}", build_message(build))),
+            Termination::Interrupted => {
+                self.log_ignore_quiet(&format!("interrupted: {}", build_message(build)))
+            }
+            Termination::Failure => self.log_ignore_quiet(&format!(
+                "{} {}",
+                "failed:".red().bold(),
+                build_message(build)
+            )),
         };
         if !result.output.is_empty() {
             std::io::stdout().write_all(&result.output).unwrap();
@@ -110,6 +120,12 @@ impl Progress for DumbConsoleProgress {
     }
 
     fn log(&mut self, msg: &str) {
+        if !self.quiet {
+            println!("{}", msg);
+        }
+    }
+
+    fn log_ignore_quiet(&mut self, msg: &str) {
         println!("{}", msg);
     }
 }
@@ -128,7 +144,7 @@ pub struct FancyConsoleProgress {
 const UPDATE_DELAY: Duration = std::time::Duration::from_millis(50);
 
 impl FancyConsoleProgress {
-    pub fn new(verbose: bool) -> Self {
+    pub fn new(verbose: bool, quiet: bool) -> Self {
         let dirty_cond = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(FancyState {
             done: false,
@@ -137,6 +153,7 @@ impl FancyConsoleProgress {
             counts: StateCounts::default(),
             tasks: VecDeque::new(),
             verbose,
+            quiet,
         }));
 
         // Thread to debounce status updates -- waits a bit, then prints after
@@ -191,6 +208,13 @@ impl Progress for FancyConsoleProgress {
     }
 
     fn log(&mut self, msg: &str) {
+        if self.state.lock().unwrap().quiet {
+            return;
+        }
+        self.state.lock().unwrap().log(msg);
+    }
+
+    fn log_ignore_quiet(&mut self, msg: &str) {
         self.state.lock().unwrap().log(msg);
     }
 }
@@ -213,6 +237,7 @@ struct FancyState {
     tasks: VecDeque<Task>,
     /// Whether to print command lines of started programs.
     verbose: bool,
+    quiet: bool,
 }
 
 impl FancyState {
@@ -257,8 +282,14 @@ impl FancyState {
                     self.log(build_message(build))
                 }
             }
-            Termination::Interrupted => self.log(&format!("interrupted: {}", build_message(build))),
-            Termination::Failure => self.log(&format!("failed: {}", build_message(build))),
+            Termination::Interrupted => {
+                self.log_ignore_quiet(&format!("interrupted: {}", build_message(build)))
+            }
+            Termination::Failure => self.log_ignore_quiet(&format!(
+                "{} {}",
+                "failed:".red().bold(),
+                build_message(build)
+            )),
         };
         if !result.output.is_empty() {
             std::io::stdout().write_all(&result.output).unwrap();
@@ -267,6 +298,15 @@ impl FancyState {
     }
 
     fn log(&mut self, msg: &str) {
+        if self.quiet {
+            return;
+        }
+        self.clear_progress();
+        println!("{}", msg);
+        self.dirty();
+    }
+
+    fn log_ignore_quiet(&mut self, msg: &str) {
         self.clear_progress();
         println!("{}", msg);
         self.dirty();
@@ -285,6 +325,9 @@ impl FancyState {
     }
 
     fn print_progress(&mut self) {
+        if self.quiet {
+            return;
+        }
         self.clear_progress();
         let failed = self.counts.get(BuildState::Failed);
         let mut progress_line = format!(

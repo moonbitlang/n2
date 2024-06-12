@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 static mut INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+#[allow(unused)]
 #[cfg(unix)]
 extern "C" fn sigint_handler(_sig: libc::c_int) {
     unsafe {
@@ -16,6 +17,7 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
     // SA_RESETHAND should clear the handler.
 }
 
+#[allow(unused)]
 #[cfg(unix)]
 pub fn register_sigint() {
     // Safety: registering a signal handler is libc unsafe code.

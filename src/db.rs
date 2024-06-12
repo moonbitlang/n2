@@ -31,7 +31,7 @@ impl From<usize> for Id {
 
 /// The loaded state of a database, as needed to make updates to the stored
 /// state.  Other state is directly loaded into the build graph.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct IdMap {
     /// Maps db::Id to FileId.
     fileids: DenseMap<Id, FileId>,
@@ -79,6 +79,7 @@ impl RecordWriter {
 }
 
 /// An opened database, ready for writes.
+#[derive(Debug)]
 pub struct Writer {
     ids: IdMap,
     w: File,
