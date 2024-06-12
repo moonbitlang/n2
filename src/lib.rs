@@ -1,9 +1,10 @@
+#![allow(clippy::all)]
 pub mod canon;
-mod db;
-mod densemap;
+pub mod db;
+pub mod densemap;
 mod depfile;
 mod eval;
-mod graph;
+pub mod graph;
 mod hash;
 pub mod load;
 pub mod parse;
@@ -12,15 +13,15 @@ mod process;
 mod process_posix;
 #[cfg(windows)]
 mod process_win;
-mod progress;
+pub mod progress;
 pub mod run;
 pub mod scanner;
 mod signal;
-mod smallmap;
+pub mod smallmap;
 mod task;
-mod terminal;
-mod trace;
-mod work;
+pub mod terminal;
+pub mod trace;
+pub mod work;
 
 #[cfg(not(any(windows, target_arch = "wasm32")))]
 use jemallocator::Jemalloc;

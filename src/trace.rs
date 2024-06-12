@@ -98,6 +98,7 @@ pub fn open(path: &str) -> std::io::Result<()> {
 }
 
 #[inline]
+#[allow(static_mut_refs)]
 pub fn if_enabled(f: impl FnOnce(&mut Trace)) {
     // Safety: accessing global mut, not threadsafe.
     unsafe {
@@ -109,6 +110,7 @@ pub fn if_enabled(f: impl FnOnce(&mut Trace)) {
 }
 
 #[inline]
+#[allow(static_mut_refs)]
 pub fn scope<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     // Safety: accessing global mut, not threadsafe.
     unsafe {

@@ -234,6 +234,7 @@ impl Loader {
 }
 
 /// State loaded by read().
+#[derive(Debug)]
 pub struct State {
     pub graph: graph::Graph,
     pub db: db::Writer,

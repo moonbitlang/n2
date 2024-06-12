@@ -93,6 +93,7 @@ fn extract_showincludes(output: Vec<u8>) -> (Vec<String>, Vec<u8>) {
 
 /// Find the span of the last line of text in buf, ignoring trailing empty
 /// lines.
+#[allow(unused)]
 fn find_last_line(buf: &[u8]) -> &[u8] {
     fn is_nl(c: u8) -> bool {
         c == b'\r' || c == b'\n'
@@ -128,7 +129,8 @@ fn run_task(
     let mut output = Vec::new();
     let termination = process::run_command(cmdline, |buf| {
         output.extend_from_slice(buf);
-        last_line_cb(find_last_line(&output));
+        // last_line_cb(find_last_line(&output));
+        last_line_cb(&output);
     })?;
 
     let mut discovered_deps = None;
