@@ -66,14 +66,16 @@ pub struct DumbConsoleProgress {
     /// when we have two updates from the same command in a row.
     last_started: Option<BuildId>,
     quiet: bool,
+    callback: Option<Box<dyn Fn(&str) + Send>>,
 }
 
 impl DumbConsoleProgress {
-    pub fn new(verbose: bool, quiet: bool) -> Self {
+    pub fn new(verbose: bool, quiet: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
         Self {
             verbose,
             last_started: None,
             quiet,
+            callback,
         }
     }
 }
@@ -115,18 +117,31 @@ impl Progress for DumbConsoleProgress {
             )),
         };
         if !result.output.is_empty() {
-            std::io::stdout().write_all(&result.output).unwrap();
+            if let Some(ref callback) = self.callback {
+                let msg = String::from_utf8_lossy(&result.output).to_string();
+                callback(&msg);
+            } else {
+                std::io::stdout().write_all(&result.output).unwrap();
+            }
         }
     }
 
     fn log(&mut self, msg: &str) {
         if !self.quiet {
-            println!("{}", msg);
+            if let Some(ref callback) = self.callback {
+                callback(msg);
+            } else {
+                println!("{}", msg);
+            }
         }
     }
 
     fn log_ignore_quiet(&mut self, msg: &str) {
-        println!("{}", msg);
+        if let Some(ref callback) = self.callback {
+            callback(msg);
+        } else {
+            println!("{}", msg);
+        }
     }
 }
 
@@ -144,7 +159,7 @@ pub struct FancyConsoleProgress {
 const UPDATE_DELAY: Duration = std::time::Duration::from_millis(50);
 
 impl FancyConsoleProgress {
-    pub fn new(verbose: bool, quiet: bool) -> Self {
+    pub fn new(verbose: bool, quiet: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
         let dirty_cond = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(FancyState {
             done: false,
@@ -154,6 +169,7 @@ impl FancyConsoleProgress {
             tasks: VecDeque::new(),
             verbose,
             quiet,
+            callback,
         }));
 
         // Thread to debounce status updates -- waits a bit, then prints after
@@ -238,6 +254,7 @@ struct FancyState {
     /// Whether to print command lines of started programs.
     verbose: bool,
     quiet: bool,
+    callback: Option<Box<dyn Fn(&str) + Send>>,
 }
 
 impl FancyState {
@@ -292,7 +309,12 @@ impl FancyState {
             )),
         };
         if !result.output.is_empty() {
-            std::io::stdout().write_all(&result.output).unwrap();
+            if let Some(ref callback) = self.callback {
+                let msg = String::from_utf8_lossy(&result.output).to_string();
+                callback(&msg);
+            } else {
+                std::io::stdout().write_all(&result.output).unwrap();
+            }
         }
         self.dirty();
     }
@@ -302,13 +324,21 @@ impl FancyState {
             return;
         }
         self.clear_progress();
-        println!("{}", msg);
+        if let Some(ref callback) = self.callback {
+            callback(msg);
+        } else {
+            println!("{}", msg);
+        }
         self.dirty();
     }
 
     fn log_ignore_quiet(&mut self, msg: &str) {
         self.clear_progress();
-        println!("{}", msg);
+        if let Some(ref c) = self.callback {
+            c(msg);
+        } else {
+            println!("{}", msg);
+        }
         self.dirty();
     }
 

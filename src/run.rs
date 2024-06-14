@@ -14,10 +14,10 @@ fn build(
 ) -> anyhow::Result<Option<usize>> {
     let (mut dumb_console, mut fancy_console);
     let progress: &mut dyn Progress = if terminal::use_fancy() {
-        fancy_console = FancyConsoleProgress::new(verbose, true);
+        fancy_console = FancyConsoleProgress::new(verbose, true, None);
         &mut fancy_console
     } else {
-        dumb_console = DumbConsoleProgress::new(verbose, true);
+        dumb_console = DumbConsoleProgress::new(verbose, true, None);
         &mut dumb_console
     };
 
