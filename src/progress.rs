@@ -42,7 +42,8 @@ pub trait Progress {
     /// used when a task fails; we want the final output to show that failed
     /// task's output even if we do more work after it fails.
     fn log(&mut self, msg: &str);
-    fn log_ignore_quiet(&mut self, msg: &str);
+
+    fn log_when_failed(&mut self, msg: &str);
 }
 
 /// Currently running build task, as tracked for progress updates.
@@ -65,16 +66,14 @@ pub struct DumbConsoleProgress {
     /// The id of the last command printed, used to avoid printing it twice
     /// when we have two updates from the same command in a row.
     last_started: Option<BuildId>,
-    quiet: bool,
     callback: Option<Box<dyn Fn(&str) + Send>>,
 }
 
 impl DumbConsoleProgress {
-    pub fn new(verbose: bool, quiet: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
+    pub fn new(verbose: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
         Self {
             verbose,
             last_started: None,
-            quiet,
             callback,
         }
     }
@@ -108,13 +107,11 @@ impl Progress for DumbConsoleProgress {
                 }
             }
             Termination::Interrupted => {
-                self.log_ignore_quiet(&format!("interrupted: {}", build_message(build)))
+                self.log_when_failed(&format!("interrupted: {}", build_message(build)))
             }
-            Termination::Failure => self.log_ignore_quiet(&format!(
-                "{} {}",
-                "failed:".red().bold(),
-                build_message(build)
-            )),
+            Termination::Failure => {
+                self.log_when_failed(&format!("failed: {}", build_message(build)))
+            }
         };
         if !result.output.is_empty() {
             if let Some(ref callback) = self.callback {
@@ -127,21 +124,13 @@ impl Progress for DumbConsoleProgress {
     }
 
     fn log(&mut self, msg: &str) {
-        if !self.quiet {
-            if let Some(ref callback) = self.callback {
-                callback(msg);
-            } else {
-                println!("{}", msg);
-            }
+        if self.callback.is_none() {
+            println!("{}", msg);
         }
     }
 
-    fn log_ignore_quiet(&mut self, msg: &str) {
-        if let Some(ref callback) = self.callback {
-            callback(msg);
-        } else {
-            println!("{}", msg);
-        }
+    fn log_when_failed(&mut self, msg: &str) {
+        println!("{}", msg);
     }
 }
 
@@ -159,7 +148,7 @@ pub struct FancyConsoleProgress {
 const UPDATE_DELAY: Duration = std::time::Duration::from_millis(50);
 
 impl FancyConsoleProgress {
-    pub fn new(verbose: bool, quiet: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
+    pub fn new(verbose: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
         let dirty_cond = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(FancyState {
             done: false,
@@ -168,7 +157,6 @@ impl FancyConsoleProgress {
             counts: StateCounts::default(),
             tasks: VecDeque::new(),
             verbose,
-            quiet,
             callback,
         }));
 
@@ -224,14 +212,11 @@ impl Progress for FancyConsoleProgress {
     }
 
     fn log(&mut self, msg: &str) {
-        if self.state.lock().unwrap().quiet {
-            return;
-        }
         self.state.lock().unwrap().log(msg);
     }
 
-    fn log_ignore_quiet(&mut self, msg: &str) {
-        self.state.lock().unwrap().log(msg);
+    fn log_when_failed(&mut self, msg: &str) {
+        self.state.lock().unwrap().log_when_failed(msg);
     }
 }
 
@@ -253,7 +238,6 @@ struct FancyState {
     tasks: VecDeque<Task>,
     /// Whether to print command lines of started programs.
     verbose: bool,
-    quiet: bool,
     callback: Option<Box<dyn Fn(&str) + Send>>,
 }
 
@@ -299,10 +283,12 @@ impl FancyState {
                     self.log(build_message(build))
                 }
             }
-            Termination::Interrupted => {
-                self.log_ignore_quiet(&format!("interrupted: {}", build_message(build)))
-            }
-            Termination::Failure => self.log_ignore_quiet(&format!(
+            Termination::Interrupted => self.log_when_failed(&format!(
+                "{} {}",
+                "interrupted:".red(),
+                build_message(build)
+            )),
+            Termination::Failure => self.log_when_failed(&format!(
                 "{} {}",
                 "failed:".red().bold(),
                 build_message(build)
@@ -320,25 +306,16 @@ impl FancyState {
     }
 
     fn log(&mut self, msg: &str) {
-        if self.quiet {
-            return;
-        }
         self.clear_progress();
-        if let Some(ref callback) = self.callback {
-            callback(msg);
-        } else {
+        if self.callback.is_none() {
             println!("{}", msg);
         }
         self.dirty();
     }
 
-    fn log_ignore_quiet(&mut self, msg: &str) {
+    fn log_when_failed(&mut self, msg: &str) {
         self.clear_progress();
-        if let Some(ref c) = self.callback {
-            c(msg);
-        } else {
-            println!("{}", msg);
-        }
+        println!("{}", msg);
         self.dirty();
     }
 
@@ -352,13 +329,14 @@ impl FancyState {
         // If the user hit ctl-c, it may have printed something on the line.
         // So \r to go to first column first, then clear anything below.
         std::io::stdout().write_all(b"\r\x1b[J").unwrap();
+        let _ = std::io::stdout().flush();
     }
 
     fn print_progress(&mut self) {
-        if self.quiet {
+        self.clear_progress();
+        if self.done {
             return;
         }
-        self.clear_progress();
         let failed = self.counts.get(BuildState::Failed);
         let mut progress_line = format!(
             "[{}] {}/{} done, ",

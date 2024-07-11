@@ -54,7 +54,7 @@ fn bench_parse_synthetic(c: &mut Criterion) {
 fn bench_parse_file(c: &mut Criterion, input: &[u8]) {
     c.bench_function("parse benches/build.ninja", |b| {
         b.iter(|| {
-            let mut parser = n2::parse::Parser::new(&input);
+            let mut parser = n2::parse::Parser::new(input);
             loop {
                 if parser.read().unwrap().is_none() {
                     break;
