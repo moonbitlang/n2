@@ -11,6 +11,7 @@ fn build(
     build_filename: String,
     targets: Vec<String>,
     verbose: bool,
+    dry_run: bool,
 ) -> anyhow::Result<Option<usize>> {
     let (mut dumb_console, mut fancy_console);
     let progress: &mut dyn Progress = if terminal::use_fancy() {
@@ -29,6 +30,7 @@ fn build(
         &options,
         progress,
         state.pools,
+        dry_run,
     );
 
     let mut tasks_finished = 0;
@@ -56,6 +58,7 @@ fn build(
                     &options,
                     progress,
                     state.pools,
+                    dry_run,
                 );
             }
         }
@@ -213,7 +216,7 @@ fn run_impl() -> anyhow::Result<i32> {
         }
     }
 
-    match build(options, args.build_file, args.targets, args.verbose)? {
+    match build(options, args.build_file, args.targets, args.verbose, false)? {
         None => {
             // Don't print any summary, the failing task is enough info.
             return Ok(1);

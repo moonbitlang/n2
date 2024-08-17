@@ -279,6 +279,7 @@ impl FancyState {
             Termination::Success => {
                 if result.output.is_empty() {
                     // Common case: don't show anything.
+                    self.log(build_message(build))
                 } else {
                     self.log(build_message(build))
                 }

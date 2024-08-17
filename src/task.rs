@@ -120,10 +120,19 @@ fn run_task(
     depfile: Option<&Path>,
     parse_showincludes: bool,
     rspfile: Option<&RspFile>,
+    dry_run: bool,
     mut last_line_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<TaskResult> {
     if let Some(rspfile) = rspfile {
         write_rspfile(rspfile)?;
+    }
+
+    if dry_run {
+        return Ok(TaskResult {
+            termination: process::Termination::Success,
+            output: Vec::new(),
+            discovered_deps: None,
+        });
     }
 
     let mut output = Vec::new();
@@ -212,7 +221,7 @@ impl Runner {
         self.running > 0
     }
 
-    pub fn start(&mut self, id: BuildId, build: &Build) {
+    pub fn start(&mut self, id: BuildId, build: &Build, dry_run: bool) {
         let cmdline = build.cmdline.clone().unwrap();
         let depfile = build.depfile.clone().map(PathBuf::from);
         let rspfile = build.rspfile.clone();
@@ -227,6 +236,7 @@ impl Runner {
                 depfile.as_deref(),
                 parse_showincludes,
                 rspfile.as_ref(),
+                dry_run,
                 |line| {
                     let _ = tx.send(Message::Output((id, line.to_owned())));
                 },
