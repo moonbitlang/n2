@@ -5,13 +5,14 @@ use crate::{
     densemap, densemap::DenseMap, graph::BuildId, graph::FileId, graph::Graph, graph::Hashes,
     hash::BuildHash,
 };
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 
 const VERSION: u32 = 1;
 
@@ -303,21 +304,75 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[derive(Debug)]
+pub struct OpenError {
+    path: PathBuf,
+    source: OpenErrorKind,
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to open {}", self.path.display())
+    }
+}
+
+impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Debug)]
+enum OpenErrorKind {
+    OpenDB(std::io::Error),
+    ReadDB(anyhow::Error),
+    CreateDB(std::io::Error),
+}
+
+impl std::fmt::Display for OpenErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenErrorKind::OpenDB(_) => write!(f, "failed to open"),
+            OpenErrorKind::ReadDB(_) => write!(f, "failed to read"),
+            OpenErrorKind::CreateDB(_) => write!(f, "failed to create"),
+        }
+    }
+}
+
+impl std::error::Error for OpenErrorKind {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OpenErrorKind::OpenDB(err) => Some(err),
+            OpenErrorKind::ReadDB(err) => Some(err.as_ref()),
+            OpenErrorKind::CreateDB(err) => Some(err),
+        }
+    }
+}
+
 /// Opens or creates an on-disk database, loading its state into the provided Graph.
-pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Result<Writer> {
+pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Writer, OpenError> {
     match std::fs::OpenOptions::new()
         .read(true)
         .append(true)
         .open(path)
     {
         Ok(mut f) => {
-            let ids = Reader::read(&mut f, graph, hashes)?;
+            let ids = Reader::read(&mut f, graph, hashes).map_err(|err| OpenError {
+                path: path.to_path_buf(),
+                source: OpenErrorKind::ReadDB(err),
+            })?;
             Ok(Writer::from_opened(ids, f))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let w = Writer::create(path)?;
+            let w = Writer::create(path).map_err(|err| OpenError {
+                path: path.to_path_buf(),
+                source: OpenErrorKind::CreateDB(err),
+            })?;
             Ok(w)
         }
-        Err(err) => Err(anyhow!(err)),
+        Err(err) => Err(OpenError {
+            path: path.to_path_buf(),
+            source: OpenErrorKind::OpenDB(err),
+        }),
     }
 }
