@@ -259,10 +259,10 @@ pub fn read(build_filename: &str) -> anyhow::Result<State> {
         if let Some(builddir) = &loader.builddir {
             db_path = Path::new(&builddir).join(db_path);
             if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!(e))?;
             }
         };
-        db::open(&db_path, &mut loader.graph, &mut hashes)
+        db::open(&db_path, &mut loader.graph, &mut hashes).map_err(|e| anyhow::anyhow!(e))
     })
     .map_err(|err| anyhow!("load .n2_db: {}", err))?;
     Ok(State {
