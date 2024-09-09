@@ -1,6 +1,7 @@
 //! Chrome trace output.
 
 use std::fs::File;
+use std::future::Future;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
@@ -51,6 +52,14 @@ impl Trace {
     fn scope<T>(&mut self, name: &str, f: impl FnOnce() -> T) -> T {
         let start = Instant::now();
         let result = f();
+        let end = Instant::now();
+        self.write_complete(name, 0, start, end);
+        result
+    }
+
+    async fn async_scope<T>(&mut self, name: &str, f: impl Future<Output = T>) -> T {
+        let start = Instant::now();
+        let result = f.await;
         let end = Instant::now();
         self.write_complete(name, 0, start, end);
         result
@@ -117,6 +126,18 @@ pub fn scope<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
         match &mut TRACE {
             None => f(),
             Some(t) => t.scope(name, f),
+        }
+    }
+}
+
+#[inline]
+#[allow(static_mut_refs)]
+pub async fn async_scope<T>(name: &'static str, f: impl Future<Output = T>) -> T {
+    // Safety: accessing global mut, not threadsafe.
+    unsafe {
+        match &mut TRACE {
+            None =>  f.await,
+            Some(t) => t.async_scope(name, f).await,
         }
     }
 }
