@@ -136,7 +136,7 @@ pub async fn async_scope<T>(name: &'static str, f: impl Future<Output = T>) -> T
     // Safety: accessing global mut, not threadsafe.
     unsafe {
         match &mut TRACE {
-            None =>  f.await,
+            None => f.await,
             Some(t) => t.async_scope(name, f).await,
         }
     }
