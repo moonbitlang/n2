@@ -101,14 +101,10 @@ impl Progress for DumbConsoleProgress {
         // ignore
     }
 
-    fn task_finished(&mut self, id: BuildId, build: &Build, result: &TaskResult) {
+    fn task_finished(&mut self, _id: BuildId, build: &Build, result: &TaskResult) {
         match result.termination {
             Termination::Success => {
-                if result.output.is_empty() || self.last_started == Some(id) {
-                    // Output is empty, or we just printed the command, don't print it again.
-                } else {
-                    self.log(build_message(build, false))
-                }
+                // Common case: don't show anything.
             }
             Termination::Interrupted => {
                 self.log_when_failed(&format!("interrupted: {}", build_message(build, true)))
@@ -281,11 +277,7 @@ impl FancyState {
             .remove(self.tasks.iter().position(|t| t.id == id).unwrap());
         match result.termination {
             Termination::Success => {
-                if result.output.is_empty() {
-                    // Common case: don't show anything.
-                } else {
-                    self.log(build_message(build, false))
-                }
+                // Common case: don't show anything.
             }
             Termination::Interrupted => self.log_when_failed(&format!(
                 "{} {}",
@@ -311,9 +303,7 @@ impl FancyState {
 
     fn log(&mut self, msg: &str) {
         self.clear_progress();
-        if self.callback.is_none() {
-            println!("{}", msg);
-        }
+        println!("{}", msg);
         self.dirty();
     }
 
