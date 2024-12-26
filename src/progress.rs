@@ -275,6 +275,9 @@ impl FancyState {
     fn task_finished(&mut self, id: BuildId, build: &Build, result: &TaskResult) {
         self.tasks
             .remove(self.tasks.iter().position(|t| t.id == id).unwrap());
+
+        self.clear_progress();
+
         match result.termination {
             Termination::Success => {
                 // Common case: don't show anything.
@@ -298,6 +301,8 @@ impl FancyState {
                 std::io::stdout().write_all(&result.output).unwrap();
             }
         }
+
+        // mark as dirty to trigger progress update
         self.dirty();
     }
 

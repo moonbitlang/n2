@@ -128,7 +128,8 @@ fn restat() -> anyhow::Result<()> {
     let out = space.run_expect(&mut n2_command(vec!["build.ninja"]))?;
     assert_output_not_contains(&out, "touch build.ninja");
 
-    // But modifying the input should cause it to be up to date.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
     space.write("in", "")?;
     let out = space.run_expect(&mut n2_command(vec!["build.ninja"]))?;
     assert_output_contains(&out, "touch build.ninja");
