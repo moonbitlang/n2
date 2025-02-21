@@ -153,6 +153,7 @@ fn run_impl() -> anyhow::Result<i32> {
         failures_left: Some(args.keep_going).filter(|&n| n > 0),
         explain: false,
         adopt: false,
+        dirty_on_output: false,
     };
 
     if let Some(dir) = args.chdir {
