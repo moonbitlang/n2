@@ -491,16 +491,19 @@ impl<'a> Work<'a> {
         }
 
         if !self.options.dirty_on_output {
+            // Original behavir
             let build = &self.graph.builds[id];
             let hash = hash::hash_build(&self.graph.files, &self.file_state, build);
             self.db.write_build(&self.graph, id, hash)?;
         } else {
-            if result.output.is_empty() {
+            // Our behavior
+            let build = &self.graph.builds[id];
+            if !result.output.is_empty() && build.can_dirty_on_output {
+                self.db.write_build(&self.graph, id, BuildHash(0))?;
+            } else {
                 let build = &self.graph.builds[id];
                 let hash = hash::hash_build(&self.graph.files, &self.file_state, build);
                 self.db.write_build(&self.graph, id, hash)?;
-            } else {
-                self.db.write_build(&self.graph, id, BuildHash(0))?;
             }
         }
 
