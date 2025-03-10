@@ -177,6 +177,8 @@ pub struct Build {
 
     /// Output files.
     pub outs: BuildOuts,
+
+    pub can_dirty_on_output: bool,
 }
 impl Build {
     pub fn new(loc: FileLoc, ins: BuildIns, outs: BuildOuts) -> Self {
@@ -191,6 +193,7 @@ impl Build {
             ins,
             discovered_ins: Vec::new(),
             outs,
+            can_dirty_on_output: false,
         }
     }
 
