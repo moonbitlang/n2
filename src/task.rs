@@ -129,8 +129,7 @@ fn run_task(
     let mut output = Vec::new();
     let termination = process::run_command(cmdline, |buf| {
         output.extend_from_slice(buf);
-        // last_line_cb(find_last_line(&output));
-        last_line_cb(&output);
+        last_line_cb(find_last_line(&output));
     })?;
 
     let mut discovered_deps = None;
