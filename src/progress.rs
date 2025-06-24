@@ -276,8 +276,6 @@ impl FancyState {
         self.tasks
             .remove(self.tasks.iter().position(|t| t.id == id).unwrap());
 
-        self.clear_progress();
-
         match result.termination {
             Termination::Success => {
                 // Common case: don't show anything.
@@ -295,6 +293,7 @@ impl FancyState {
         };
         if !result.output.is_empty() {
             if let Some(ref callback) = self.callback {
+                self.clear_progress();
                 let msg = String::from_utf8_lossy(&result.output).to_string();
                 callback(&msg);
             } else {
