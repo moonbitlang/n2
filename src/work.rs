@@ -314,6 +314,9 @@ pub struct Options {
     pub explain: bool,
     /// When true, just mark targets up to date without running anything.
     pub adopt: bool,
+    /// Invalidate a build if it has output. This is a MoonBit-specific
+    /// workaround to avoid the build system eating warnings for builds that
+    /// are not dirty in a specific run.
     pub dirty_on_output: bool,
 }
 
