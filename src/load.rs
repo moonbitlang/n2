@@ -166,7 +166,8 @@ impl Loader {
         build.rspfile = rspfile;
         build.pool = pool;
 
-        self.graph.add_build(build)
+        self.graph.add_build(build)?;
+        Ok(())
     }
 
     fn read_file(&mut self, id: FileId) -> anyhow::Result<()> {

@@ -293,7 +293,7 @@ impl Graph {
     }
 
     /// Add a new Build, generating a BuildId for it.
-    pub fn add_build(&mut self, mut build: Build) -> anyhow::Result<()> {
+    pub fn add_build(&mut self, mut build: Build) -> anyhow::Result<BuildId> {
         let new_id = self.builds.next_id();
         for &id in &build.ins.ids {
             self.files.by_id[id].dependents.push(new_id);
@@ -324,7 +324,7 @@ impl Graph {
             build.outs.remove_duplicates();
         }
         self.builds.push(build);
-        Ok(())
+        Ok(new_id)
     }
 }
 
