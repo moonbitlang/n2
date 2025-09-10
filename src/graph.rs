@@ -39,7 +39,7 @@ impl From<usize> for BuildId {
 }
 
 /// A single file referenced as part of a build.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct File {
     /// Canonical path to the file.
     pub name: String,
@@ -56,7 +56,7 @@ impl File {
 }
 
 /// A textual location within a build.ninja file, used in error messages.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileLoc {
     pub filename: std::rc::Rc<PathBuf>,
     pub line: usize,
@@ -74,7 +74,7 @@ pub struct RspFile {
 }
 
 /// Input files to a Build.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BuildIns {
     /// Internally we stuff explicit/implicit/order-only ins all into one Vec.
     /// This is mostly to simplify some of the iteration and is a little more
@@ -89,7 +89,7 @@ pub struct BuildIns {
 }
 
 /// Output files from a Build.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BuildOuts {
     /// Similar to ins, we keep both explicit and implicit outs in one Vec.
     pub ids: Vec<FileId>,
@@ -147,7 +147,7 @@ mod tests {
 }
 
 /// A single build action, generating File outputs from File inputs with a command.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Build {
     /// Source location this Build was declared.
     pub location: FileLoc,
@@ -255,7 +255,7 @@ impl Build {
 }
 
 /// The build graph: owns Files/Builds and maps FileIds/BuildIds to them.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Graph {
     pub builds: DenseMap<BuildId, Build>,
     pub files: GraphFiles,
@@ -263,7 +263,7 @@ pub struct Graph {
 
 /// Files identified by FileId, as well as mapping string filenames to them.
 /// Split from Graph for lifetime reasons.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GraphFiles {
     pub by_id: DenseMap<FileId, File>,
     by_name: FxHashMap<String, FileId>,
