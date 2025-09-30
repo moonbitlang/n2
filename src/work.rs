@@ -493,21 +493,31 @@ impl<'a> Work<'a> {
             return Ok(());
         }
 
-        if !self.options.dirty_on_output {
-            // Original behavir
+        // Our behavior
+        let build = &self.graph.builds[id];
+        if self.options.dirty_on_output && !result.output.is_empty() && build.can_dirty_on_output {
+            if self.options.explain {
+                self.progress.log(&format!(
+                    "explain: {}: output produced, marking dirty",
+                    build.location
+                ));
+            }
+            self.db.write_build(&self.graph, id, BuildHash(0))?;
+        } else {
             let build = &self.graph.builds[id];
             let hash = hash::hash_build(&self.graph.files, &self.file_state, build);
-            self.db.write_build(&self.graph, id, hash)?;
-        } else {
-            // Our behavior
-            let build = &self.graph.builds[id];
-            if !result.output.is_empty() && build.can_dirty_on_output {
-                self.db.write_build(&self.graph, id, BuildHash(0))?;
-            } else {
-                let build = &self.graph.builds[id];
-                let hash = hash::hash_build(&self.graph.files, &self.file_state, build);
-                self.db.write_build(&self.graph, id, hash)?;
+
+            if self.options.explain {
+                self.progress
+                    .log(&format!("Finished {} with hash {:?}", build.location, hash));
+                self.progress.log(&hash::explain_hash_build(
+                    &self.graph.files,
+                    &self.file_state,
+                    build,
+                ));
             }
+
+            self.db.write_build(&self.graph, id, hash)?;
         }
 
         Ok(())
@@ -653,8 +663,10 @@ impl<'a> Work<'a> {
         let hash = hash::hash_build(&self.graph.files, &self.file_state, build);
         if prev_hash != hash {
             if self.options.explain {
-                self.progress
-                    .log(&format!("explain: {}: manifest changed", build.location));
+                self.progress.log(&format!(
+                    "explain: {}: manifest changed: hashes prev {:?}, now {:?}",
+                    build.location, prev_hash, hash
+                ));
                 self.progress.log(&hash::explain_hash_build(
                     &self.graph.files,
                     &self.file_state,
