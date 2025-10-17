@@ -11,6 +11,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -141,6 +142,8 @@ impl Progress for DumbConsoleProgress {
 /// clearing the console too.
 pub struct FancyConsoleProgress {
     state: Arc<Mutex<FancyState>>,
+    /// The handle to the progress printer thread.
+    handle: Option<JoinHandle<()>>,
 }
 
 /// Screen updates happen after this duration passes, to reduce the amount
@@ -162,7 +165,7 @@ impl FancyConsoleProgress {
 
         // Thread to debounce status updates -- waits a bit, then prints after
         // any dirty state.
-        std::thread::spawn({
+        let handle = std::thread::spawn({
             let state = state.clone();
             move || loop {
                 // Wait to be notified of a display update, or timeout at 500ms.
@@ -183,14 +186,25 @@ impl FancyConsoleProgress {
                 }
 
                 // Delay a little bit in case more display updates come in.
-                std::thread::sleep(UPDATE_DELAY);
+                // Abort if we're done ;)
+                {
+                    let (state, _) = dirty_cond
+                        .wait_timeout_while(state.lock().unwrap(), UPDATE_DELAY, |_| false)
+                        .unwrap();
+                    if state.done {
+                        break;
+                    }
+                }
 
                 // Update regardless of whether we timed out or not.
                 state.lock().unwrap().print_progress();
             }
         });
 
-        FancyConsoleProgress { state }
+        FancyConsoleProgress {
+            state,
+            handle: Some(handle),
+        }
     }
 }
 
@@ -223,6 +237,11 @@ impl Progress for FancyConsoleProgress {
 impl Drop for FancyConsoleProgress {
     fn drop(&mut self) {
         self.state.lock().unwrap().cleanup();
+        self.handle
+            .take()
+            .unwrap()
+            .join()
+            .expect("Failed to join the progress thread");
     }
 }
 
