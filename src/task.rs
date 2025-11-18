@@ -126,16 +126,6 @@ fn run_task(
     rspfile: Option<&RspFile>,
     mut last_line_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<TaskResult> {
-    // Parent span covering the full task lifecycle, including rspfile write.
-    let depfile_str = depfile.map(|p| p.display().to_string());
-    let span = tracing::info_span!(
-        "task.run",
-        cmdline = %cmdline,
-        depfile = %depfile_str.as_deref().unwrap_or(""),
-        rspfile_present = rspfile.is_some(),
-    );
-    let _enter = span.enter();
-
     if let Some(rspfile) = rspfile {
         let rsp_span = tracing::info_span!("task.write_rspfile");
         let _rsp_enter = rsp_span.enter();
@@ -178,30 +168,91 @@ fn run_task(
     })
 }
 
-/// Tracks faked "thread ids" -- integers assigned to build tasks to track
-/// parallelism in perf trace output.
+/// A threadpool for running build tasks.
 #[derive(Default)]
 struct ThreadIds {
     /// An entry is true when claimed, false or nonexistent otherwise.
-    slots: Vec<bool>,
+    slots: Vec<ThreadSlot>,
 }
+
+struct ThreadSlot {
+    claimed: bool,
+    /// Send a closure to run on this thread.
+    sender: Option<mpsc::Sender<ThreadPoolTask>>,
+    /// Handle for the thread running tasks for this slot.
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ThreadSlot {
+    fn new() -> Self {
+        ThreadSlot {
+            claimed: false,
+            sender: None,
+            handle: None,
+        }
+    }
+
+    /// Ensure the thread for this slot is running.
+    ///
+    /// After this call, `self.sender` is guaranteed to be `Some`.
+    fn ensure_thread(&mut self) {
+        if self.sender.is_some() {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel::<ThreadPoolTask>();
+        let handle = std::thread::spawn(move || {
+            while let Ok(task) = rx.recv() {
+                task();
+            }
+        });
+
+        self.sender = Some(tx);
+        self.handle = Some(handle);
+    }
+}
+
+type ThreadPoolTask = Box<dyn FnOnce() + Send>;
+
 impl ThreadIds {
-    fn claim(&mut self) -> usize {
-        match self.slots.iter().position(|&used| !used) {
+    fn claim(&mut self) -> (usize, &mpsc::Sender<ThreadPoolTask>) {
+        match self.slots.iter().position(|slot| !slot.claimed) {
             Some(idx) => {
-                self.slots[idx] = true;
-                idx
+                let slot = &mut self.slots[idx];
+                slot.claimed = true;
+                slot.ensure_thread();
+
+                (idx, slot.sender.as_ref().unwrap())
             }
             None => {
                 let idx = self.slots.len();
-                self.slots.push(true);
-                idx
+                self.slots.push(ThreadSlot::new());
+
+                let slot = &mut self.slots[idx];
+                slot.claimed = true;
+                slot.ensure_thread();
+
+                (idx, &slot.sender.as_ref().unwrap())
             }
         }
     }
 
     fn release(&mut self, slot: usize) {
-        self.slots[slot] = false;
+        self.slots[slot].claimed = false;
+    }
+}
+
+impl Drop for ThreadIds {
+    fn drop(&mut self) {
+        for slot in &mut self.slots {
+            // Drop the sender to signal the thread to exit.
+            drop(slot.sender.take());
+
+            // Wait for the thread to exit.
+            if let Some(handle) = slot.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -244,43 +295,46 @@ impl Runner {
         let rspfile = build.rspfile.clone();
         let parse_showincludes = build.parse_showincludes;
 
-        let tid = self.tids.claim();
+        let (tid, task_tx) = self.tids.claim();
         let tx = self.tx.clone();
         let desc_msg = crate::progress::build_message(build, true).to_string();
 
         tracing::info!(tid = tid, buildid = ?id, "starting task");
 
-        std::thread::spawn(move || {
-            // Parent per-task span to mirror and extend Chrome tracing lanes.
-            let task_span = tracing::info_span!("task", tid = tid, buildid = ?id, desc = %desc_msg);
-            let _task_enter = task_span.enter();
+        task_tx
+            .send(Box::new(move || {
+                // Parent per-task span to mirror and extend Chrome tracing lanes.
+                let task_span = tracing::info_span!("n2.task", desc=desc_msg, cmdline=%cmdline);
+                let _task_enter = task_span.enter();
 
-            let start = Instant::now();
-            let result = run_task(
-                &cmdline,
-                depfile.as_deref(),
-                parse_showincludes,
-                rspfile.as_ref(),
-                |line| {
-                    let _ = tx.send(Message::Output((id, line.to_owned())));
-                },
-            )
-            .unwrap_or_else(|err| TaskResult {
-                termination: process::Termination::Failure,
-                output: format!("{}\n", err).into_bytes(),
-                discovered_deps: None,
-            });
-            let finish = Instant::now();
+                let start = Instant::now();
+                let result = run_task(
+                    &cmdline,
+                    depfile.as_deref(),
+                    parse_showincludes,
+                    rspfile.as_ref(),
+                    |line| {
+                        let _ = tx.send(Message::Output((id, line.to_owned())));
+                    },
+                )
+                .unwrap_or_else(|err| TaskResult {
+                    termination: process::Termination::Failure,
+                    output: format!("{}\n", err).into_bytes(),
+                    discovered_deps: None,
+                });
+                let finish = Instant::now();
 
-            let task = FinishedTask {
-                tid,
-                buildid: id,
-                span: (start, finish),
-                result,
-            };
-            // The send will only fail if the receiver disappeared, e.g. due to shutting down.
-            let _ = tx.send(Message::Done(task));
-        });
+                let task = FinishedTask {
+                    tid,
+                    buildid: id,
+                    span: (start, finish),
+                    result,
+                };
+                // The send will only fail if the receiver disappeared, e.g. due to shutting down.
+                let _ = tx.send(Message::Done(task));
+            }))
+            .expect("failed to send task to thread, this is a bug");
+
         self.running += 1;
     }
 

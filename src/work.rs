@@ -838,7 +838,7 @@ impl<'a> Work<'a> {
                 .task_finished(task.buildid, build, &task.result);
             match task.result.termination {
                 process::Termination::Failure => {
-                    tracing::warn!(buildid = ?task.buildid, location = %build.location, "build failed");
+                    tracing::info!(buildid = ?task.buildid, location = %build.location, "build failed");
                     if let Some(failures_left) = &mut self.options.failures_left {
                         *failures_left -= 1;
                         if *failures_left == 0 {
@@ -850,7 +850,7 @@ impl<'a> Work<'a> {
                         .set(task.buildid, build, BuildState::Failed);
                 }
                 process::Termination::Interrupted => {
-                    tracing::warn!(buildid = ?task.buildid, "build interrupted");
+                    tracing::info!(buildid = ?task.buildid, "build interrupted");
                     // If the task was interrupted bail immediately.
                     return Ok(None);
                 }
