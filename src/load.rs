@@ -172,6 +172,8 @@ impl Loader {
 
     fn read_file(&mut self, id: FileId) -> anyhow::Result<()> {
         let path = self.graph.file(id).path().to_path_buf();
+        let span = tracing::info_span!("load.read_file", path = %path.display());
+        let _enter = span.enter();
         let bytes = match trace::scope("read file", || scanner::read_file_with_nul(&path)) {
             Ok(b) => b,
             Err(e) => bail!("read {}: {}", path.display(), e),
@@ -185,10 +187,16 @@ impl Loader {
         envs: &[&dyn eval::Env],
     ) -> anyhow::Result<()> {
         let evaluated = self.evaluate_path(file, envs);
+        let span = tracing::info_span!("load.evaluate_and_read_file", file = %self.graph.file(evaluated).name);
+        let _enter = span.enter();
         self.read_file(evaluated)
     }
 
     pub fn parse(&mut self, path: PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
+        let path_str = path.display().to_string();
+        let span = tracing::info_span!("load.parse", path = %path_str, bytes_len = bytes.len());
+        let _enter = span.enter();
+
         let filename = std::rc::Rc::new(path);
 
         let mut parser = parse::Parser::new(&bytes);
@@ -202,13 +210,21 @@ impl Loader {
                 Some(s) => s,
             };
             match stmt {
-                Statement::Include(id) => trace::scope("include", || {
-                    self.evaluate_and_read_file(id, &[&parser.vars])
-                })?,
+                Statement::Include(id) => {
+                    let span = tracing::info_span!("load.include");
+                    let _enter = span.enter();
+                    trace::scope("include", || {
+                        self.evaluate_and_read_file(id, &[&parser.vars])
+                    })?
+                }
                 // TODO: implement scoping for subninja
-                Statement::Subninja(id) => trace::scope("subninja", || {
-                    self.evaluate_and_read_file(id, &[&parser.vars])
-                })?,
+                Statement::Subninja(id) => {
+                    let span = tracing::info_span!("load.subninja");
+                    let _enter = span.enter();
+                    trace::scope("subninja", || {
+                        self.evaluate_and_read_file(id, &[&parser.vars])
+                    })?
+                }
                 Statement::Default(defaults) => {
                     let evaluated = self.evaluate_paths(defaults, &[&parser.vars]);
                     self.default.extend(evaluated);
@@ -246,6 +262,8 @@ pub struct State {
 
 /// Load build.ninja/.n2_db and return the loaded build graph and state.
 pub fn read(build_filename: &str) -> anyhow::Result<State> {
+    let span = tracing::info_span!("load.read", build_filename = %build_filename);
+    let _enter = span.enter();
     let mut loader = Loader::new();
     trace::scope("loader.read_file", || {
         let id = loader

@@ -122,18 +122,36 @@ fn run_task(
     rspfile: Option<&RspFile>,
     mut last_line_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<TaskResult> {
+    // Parent span covering the full task lifecycle, including rspfile write.
+    let depfile_str = depfile.map(|p| p.display().to_string());
+    let span = tracing::info_span!(
+        "task.run",
+        cmdline = %cmdline,
+        depfile = %depfile_str.as_deref().unwrap_or(""),
+        rspfile_present = rspfile.is_some(),
+    );
+    let _enter = span.enter();
+
     if let Some(rspfile) = rspfile {
+        let rsp_span = tracing::info_span!("task.write_rspfile");
+        let _rsp_enter = rsp_span.enter();
         write_rspfile(rspfile)?;
     }
 
     let mut output = Vec::new();
-    let termination = process::run_command(cmdline, |buf| {
-        output.extend_from_slice(buf);
-        last_line_cb(find_last_line(&output));
-    })?;
+    let termination = {
+        let exec_span = tracing::info_span!("task.exec");
+        let _exec_enter = exec_span.enter();
+        process::run_command(cmdline, |buf| {
+            output.extend_from_slice(buf);
+            last_line_cb(find_last_line(&output));
+        })?
+    };
 
     let mut discovered_deps = None;
     if parse_showincludes {
+        let parse_span = tracing::info_span!("task.parse_showincludes");
+        let _parse_enter = parse_span.enter();
         // Remove /showIncludes lines from output, regardless of success/fail.
         let (includes, filtered) = extract_showincludes(output);
         output = filtered;
@@ -141,7 +159,12 @@ fn run_task(
     }
     if termination == process::Termination::Success {
         if let Some(depfile) = depfile {
-            discovered_deps = Some(read_depfile(depfile)?);
+            let read_span =
+                tracing::info_span!("task.read_depfile", deps_count = tracing::field::Empty);
+            let _read_enter = read_span.enter();
+            let deps = read_depfile(depfile)?;
+            read_span.record("deps_count", &tracing::field::display(deps.len()));
+            discovered_deps = Some(deps);
         }
     }
     Ok(TaskResult {
@@ -219,7 +242,13 @@ impl Runner {
 
         let tid = self.tids.claim();
         let tx = self.tx.clone();
+        let desc_msg = crate::progress::build_message(build, true).to_string();
+
         std::thread::spawn(move || {
+            // Parent per-task span to mirror and extend Chrome tracing lanes.
+            let task_span = tracing::info_span!("task", tid = tid, buildid = ?id, desc = %desc_msg);
+            let _task_enter = task_span.enter();
+
             let start = Instant::now();
             let result = run_task(
                 &cmdline,
