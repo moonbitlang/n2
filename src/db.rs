@@ -378,6 +378,7 @@ pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Write
     {
         Ok(mut f) => {
             let _branch = tracing::info_span!("db.open_existing").entered();
+            tracing::info!(path = %path.display(), "opening existing database");
             let ids = {
                 let _read = tracing::info_span!("db.read").entered();
                 Reader::read(&mut f, graph, hashes).map_err(|err| OpenError {
@@ -385,10 +386,12 @@ pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Write
                     source: OpenErrorKind::ReadDB(err),
                 })?
             };
+            tracing::info!(path = %path.display(), "database loaded successfully");
             Ok(Writer::from_opened(ids, f))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let _create = tracing::info_span!("db.create").entered();
+            tracing::info!(path = %path.display(), "creating new database");
             let w = Writer::create(path).map_err(|err| OpenError {
                 path: path.to_path_buf(),
                 source: OpenErrorKind::CreateDB(err),

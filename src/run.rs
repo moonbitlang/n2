@@ -191,7 +191,9 @@ fn run_impl() -> anyhow::Result<i32> {
         match tool.as_str() {
             "list" => {
                 println!("subcommands:");
-                println!("  (none yet, but see README if you're looking here trying to get CMake to work)");
+                println!(
+                    "  (none yet, but see README if you're looking here trying to get CMake to work)"
+                );
                 return Ok(1);
             }
             "compdb" if fake_ninja_compat => {
@@ -221,9 +223,11 @@ fn run_impl() -> anyhow::Result<i32> {
         }
         Some(0) => {
             // Special case: don't print numbers when no work done.
+            tracing::info!("no work to do");
             println!("n2: no work to do");
         }
         Some(n) => {
+            tracing::info!(tasks_executed = n, "build completed successfully");
             println!(
                 "n2: ran {} task{}, now up to date",
                 n,

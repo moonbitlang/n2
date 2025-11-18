@@ -264,6 +264,7 @@ pub struct State {
 pub fn read(build_filename: &str) -> anyhow::Result<State> {
     let span = tracing::info_span!("load.read", build_filename = %build_filename);
     let _enter = span.enter();
+    tracing::info!(build_filename = %build_filename, "loading build graph");
     let mut loader = Loader::new();
     trace::scope("loader.read_file", || {
         let id = loader
@@ -284,6 +285,7 @@ pub fn read(build_filename: &str) -> anyhow::Result<State> {
         db::open(&db_path, &mut loader.graph, &mut hashes).map_err(|e| anyhow::anyhow!(e))
     })
     .map_err(|err| anyhow!("load .n2_db: {}", err))?;
+    tracing::info!(default_targets = loader.default.len(), "loaded build graph");
     Ok(State {
         graph: loader.graph,
         db,

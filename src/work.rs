@@ -456,6 +456,7 @@ impl<'a> Work<'a> {
         // Clean up the deps discovered from the task.
         let mut deps = Vec::new();
         if let Some(names) = result.discovered_deps {
+            tracing::debug!(buildid = ?id, discovered_count = names.len(), "processing discovered dependencies");
             for name in names {
                 let fileid = self.graph.files.id_from_canonical(canon_path(name));
                 // Filter duplicates from the file list.
@@ -742,6 +743,11 @@ impl<'a> Work<'a> {
             logger_present = logger.is_some()
         );
         let _enter = span.enter();
+        tracing::info!(
+            parallelism = self.options.parallelism,
+            total_pending = self.build_states.total_pending,
+            "starting build execution"
+        );
         let mut tasks_done = 0;
         let mut tasks_failed = 0;
         let mut runner = task::Runner::new(self.options.parallelism);
@@ -765,6 +771,7 @@ impl<'a> Work<'a> {
                     None => break,
                 };
                 let build = &self.graph.builds[id];
+                tracing::info!(buildid = ?id, location = %build.location, "executing build");
                 self.build_states.set(id, build, BuildState::Running);
                 self.create_parent_dirs(build.outs())?;
                 runner.start(id, build);
@@ -775,6 +782,7 @@ impl<'a> Work<'a> {
             while let Some(id) = self.build_states.pop_ready() {
                 if !self.check_build_dirty(id)? {
                     // Not dirty; go directly to the Done state.
+                    tracing::info!(buildid = ?id, "build up to date, skipping");
                     self.ready_dependents(id);
                 } else if self.options.adopt {
                     // Act as if the target already finished.
@@ -830,6 +838,7 @@ impl<'a> Work<'a> {
                 .task_finished(task.buildid, build, &task.result);
             match task.result.termination {
                 process::Termination::Failure => {
+                    tracing::warn!(buildid = ?task.buildid, location = %build.location, "build failed");
                     if let Some(failures_left) = &mut self.options.failures_left {
                         *failures_left -= 1;
                         if *failures_left == 0 {
@@ -841,10 +850,12 @@ impl<'a> Work<'a> {
                         .set(task.buildid, build, BuildState::Failed);
                 }
                 process::Termination::Interrupted => {
+                    tracing::warn!(buildid = ?task.buildid, "build interrupted");
                     // If the task was interrupted bail immediately.
                     return Ok(None);
                 }
                 process::Termination::Success => {
+                    tracing::info!(buildid = ?task.buildid, location = %build.location, "build succeeded");
                     tasks_done += 1;
                     self.record_finished(task.buildid, task.result)?;
                     self.ready_dependents(task.buildid);
@@ -857,6 +868,12 @@ impl<'a> Work<'a> {
         // "interrupted by user" and exit with success, and in that case we
         // don't want n2 to print a "succeeded" message afterwards.
         let success = tasks_failed == 0 && !signal::was_interrupted();
+        tracing::info!(
+            tasks_done = tasks_done,
+            tasks_failed = tasks_failed,
+            success = success,
+            "build execution completed"
+        );
         Ok(success.then_some(tasks_done))
     }
 }
