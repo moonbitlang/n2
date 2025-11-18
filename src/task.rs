@@ -42,7 +42,10 @@ fn read_depfile(path: &Path) -> anyhow::Result<Vec<String>> {
         Ok(b) => b,
         // See discussion of missing depfiles in #80.
         // TODO(#99): warn or error in this circumstance?
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(path = %path.display(), "depfile not found");
+            return Ok(Vec::new());
+        }
         Err(e) => bail!("read {}: {}", path.display(), e),
     };
 
@@ -55,6 +58,7 @@ fn read_depfile(path: &Path) -> anyhow::Result<Vec<String>> {
         .flat_map(|x| x.iter())
         .map(|&dep| dep.to_owned())
         .collect();
+    tracing::info!(path = %path.display(), deps_count = deps.len(), "read depfile");
     Ok(deps)
 }
 
@@ -243,6 +247,8 @@ impl Runner {
         let tid = self.tids.claim();
         let tx = self.tx.clone();
         let desc_msg = crate::progress::build_message(build, true).to_string();
+
+        tracing::info!(tid = tid, buildid = ?id, "starting task");
 
         std::thread::spawn(move || {
             // Parent per-task span to mirror and extend Chrome tracing lanes.
