@@ -132,6 +132,15 @@ impl Writer {
         hash: BuildHash,
     ) -> std::io::Result<()> {
         let build = &graph.builds[id];
+
+        // Span to capture DB write details; parent load/work spans carry context.
+        let db_span = tracing::info_span!(
+            "db.write_build",
+            outs_len = build.outs().len(),
+            deps_len = build.discovered_ins().len()
+        );
+        let _enter = db_span.enter();
+
         let mut w = RecordWriter::default();
         let outs = build.outs();
         let mark = (outs.len() as u16) | 0b1000_0000_0000_0000;
@@ -272,6 +281,9 @@ impl<'a> Reader<'a> {
     }
 
     fn read_file(&mut self) -> anyhow::Result<()> {
+        let span = tracing::info_span!("db.read_file");
+        let _enter = span.enter();
+
         self.read_signature()?;
         loop {
             let mut len = match self.read_u16() {
@@ -281,8 +293,13 @@ impl<'a> Reader<'a> {
             };
             let mask = 0b1000_0000_0000_0000;
             if len & mask == 0 {
+                let _path_span =
+                    tracing::info_span!("db.read_path_record", name_len = (len as usize)).entered();
                 self.read_path(len as usize)?;
             } else {
+                let outs_len = (len & !mask) as usize;
+                let _build_span =
+                    tracing::info_span!("db.read_build_record", outs_len = outs_len).entered();
                 len &= !mask;
                 self.read_build(len as usize)?;
             }
@@ -351,19 +368,27 @@ impl std::error::Error for OpenErrorKind {
 
 /// Opens or creates an on-disk database, loading its state into the provided Graph.
 pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Writer, OpenError> {
+    let span = tracing::info_span!("db.open", path = %path.display());
+    let _enter = span.enter();
+
     match std::fs::OpenOptions::new()
         .read(true)
         .append(true)
         .open(path)
     {
         Ok(mut f) => {
-            let ids = Reader::read(&mut f, graph, hashes).map_err(|err| OpenError {
-                path: path.to_path_buf(),
-                source: OpenErrorKind::ReadDB(err),
-            })?;
+            let _branch = tracing::info_span!("db.open_existing").entered();
+            let ids = {
+                let _read = tracing::info_span!("db.read").entered();
+                Reader::read(&mut f, graph, hashes).map_err(|err| OpenError {
+                    path: path.to_path_buf(),
+                    source: OpenErrorKind::ReadDB(err),
+                })?
+            };
             Ok(Writer::from_opened(ids, f))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let _create = tracing::info_span!("db.create").entered();
             let w = Writer::create(path).map_err(|err| OpenError {
                 path: path.to_path_buf(),
                 source: OpenErrorKind::CreateDB(err),

@@ -406,6 +406,9 @@ impl<'a> Work<'a> {
         discovered: bool,
     ) -> anyhow::Result<Option<FileId>> {
         let build = &self.graph.builds[id];
+        let span =
+            tracing::info_span!("work.ensure_input_files", buildid = ?id, discovered = discovered);
+        let _enter = span.enter();
         let ids = if discovered {
             build.discovered_ins()
         } else {
@@ -448,6 +451,8 @@ impl<'a> Work<'a> {
     /// Given a task that just finished, record any discovered deps and hash.
     /// Postcondition: all outputs have been stat()ed.
     fn record_finished(&mut self, id: BuildId, result: task::TaskResult) -> anyhow::Result<()> {
+        let span = tracing::info_span!("work.record_finished", buildid = ?id, output_len = result.output.len());
+        let _enter = span.enter();
         // Clean up the deps discovered from the task.
         let mut deps = Vec::new();
         if let Some(names) = result.discovered_deps {
@@ -468,6 +473,8 @@ impl<'a> Work<'a> {
         }
 
         // We may have discovered new deps, so ensure we have mtimes for those.
+        let upd_span = tracing::info_span!("work.update_discovered", deps_len = deps.len());
+        let _upd_enter = upd_span.enter();
         let deps_changed = self.graph.builds[id].update_discovered(deps);
         if deps_changed {
             if let Some(missing) = self.ensure_input_files(id, true)? {
@@ -505,6 +512,8 @@ impl<'a> Work<'a> {
             self.db.write_build(&self.graph, id, BuildHash(0))?;
         } else {
             let build = &self.graph.builds[id];
+            let hash_span = tracing::info_span!("work.hash_build");
+            let _hash_enter = hash_span.enter();
             let hash = hash::hash_build(&self.graph.files, &self.file_state, build);
 
             if self.options.explain {
@@ -551,6 +560,8 @@ impl<'a> Work<'a> {
     /// after (to see if it touched any outputs).
     fn stat_all_outputs(&mut self, id: BuildId) -> anyhow::Result<Option<FileId>> {
         let build = &self.graph.builds[id];
+        let span = tracing::info_span!("work.stat_all_outputs", buildid = ?id, outs_len = build.outs().len());
+        let _enter = span.enter();
         let mut missing = None;
         for &id in build.outs() {
             let file = self.graph.file(id);
@@ -620,6 +631,8 @@ impl<'a> Work<'a> {
     fn check_build_dirty(&mut self, id: BuildId) -> anyhow::Result<bool> {
         let build = &self.graph.builds[id];
         let phony = build.cmdline.is_none();
+        let span = tracing::info_span!("work.check_build_dirty", buildid = ?id, phony = phony);
+        let _enter = span.enter();
         let file_missing = if phony {
             self.check_build_files_missing_phony(id)?;
             return Ok(false); // Phony builds never need to run anything.
@@ -699,6 +712,16 @@ impl<'a> Work<'a> {
     /// Runs the build.
     /// Returns the number of tasks executed on successful builds, or None on failed builds.
     pub fn run(&mut self) -> anyhow::Result<Option<usize>> {
+        let span = tracing::info_span!(
+            "work.run",
+            parallelism = self.options.parallelism,
+            failures_left = ?self.options.failures_left,
+            adopt = self.options.adopt,
+            explain = self.options.explain,
+            dirty_on_output = self.options.dirty_on_output
+        );
+        let _enter = span.enter();
+
         self.run_with_logger(None)
     }
 
@@ -708,6 +731,17 @@ impl<'a> Work<'a> {
     ) -> anyhow::Result<Option<usize>> {
         // #[cfg(unix)]
         // signal::register_sigint();
+
+        let span = tracing::info_span!(
+            "work.run_with_logger",
+            parallelism = self.options.parallelism,
+            failures_left = ?self.options.failures_left,
+            adopt = self.options.adopt,
+            explain = self.options.explain,
+            dirty_on_output = self.options.dirty_on_output,
+            logger_present = logger.is_some()
+        );
+        let _enter = span.enter();
         let mut tasks_done = 0;
         let mut tasks_failed = 0;
         let mut runner = task::Runner::new(self.options.parallelism);
