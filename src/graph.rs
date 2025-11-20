@@ -6,12 +6,12 @@ use crate::{
     densemap::{self, DenseMap},
     hash::BuildHash,
 };
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Id for File nodes in the Graph.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct FileId(u32);
 impl densemap::Index for FileId {
     fn index(&self) -> usize {
@@ -271,14 +271,13 @@ pub struct GraphFiles {
 
 impl Graph {
     pub fn get_start_nodes(&self) -> Vec<FileId> {
-        use std::collections::HashSet;
         let mut starts = vec![];
         let n = self.files.by_name.len() as u32;
         for i in 0..n {
             let fid = FileId(i);
             starts.push(fid);
         }
-        let mut starts: HashSet<FileId> = starts.into_iter().collect();
+        let mut starts: BTreeSet<FileId> = starts.into_iter().collect();
         for build in self.builds.iter() {
             for fid in build.ins.ids.iter() {
                 starts.remove(fid);
