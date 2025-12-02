@@ -184,8 +184,8 @@ pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::R
         // TODO: Set this to just 0 for console pool jobs.
         let process_flags = CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT;
 
-        let mut startup_info = std::mem::zeroed::<STARTUPINFOEXA>();
-        startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXA>() as u32;
+        let mut startup_info = std::mem::zeroed::<STARTUPINFOEXW>();
+        startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         startup_info.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
         let raw_pipe_write = pipe_write.as_raw_handle() as isize;
@@ -201,10 +201,10 @@ pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::R
 
         let mut process_info = ProcessInformation::new();
 
-        let mut cmdline_nul: Vec<u8> = String::from(cmdline).into_bytes();
+        let mut cmdline_nul: Vec<u16> = cmdline.encode_utf16().collect();
         cmdline_nul.push(0);
 
-        if CreateProcessA(
+        if CreateProcessW(
             std::ptr::null_mut(),
             cmdline_nul.as_mut_ptr(),
             std::ptr::null_mut(),
@@ -228,7 +228,7 @@ pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::R
                     }
                 }
             }
-            win_bail!(CreateProcessA);
+            win_bail!(CreateProcessW);
         }
         drop(pipe_write);
 
