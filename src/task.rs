@@ -297,7 +297,7 @@ impl Runner {
 
         let (tid, task_tx) = self.tids.claim();
         let tx = self.tx.clone();
-        let desc_msg = crate::progress::build_message(build, true).to_string();
+        let desc_msg = crate::progress::build_message(build, false).to_string();
 
         tracing::info!(tid = tid, buildid = ?id, "starting task");
 
