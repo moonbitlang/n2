@@ -304,11 +304,18 @@ impl FancyState {
                 "interrupted:".red(),
                 build_message(build, true)
             )),
-            Termination::Failure => self.log_when_failed(&format!(
-                "{} {}",
-                "failed:".red().bold(),
-                build_message(build, true)
-            )),
+            Termination::Failure => {
+                // Show failed message, with command line if in verbose mode.
+                if self.verbose {
+                    self.log_when_failed(&format!(
+                        "{} {}",
+                        "failed:".red().bold(),
+                        build_message(build, true)
+                    ))
+                } else {
+                    self.log_when_failed(&format!("{}", "failed".red().bold()))
+                }
+            }
         };
         if !result.output.is_empty() {
             if let Some(ref callback) = self.callback {
