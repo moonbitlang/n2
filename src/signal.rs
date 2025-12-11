@@ -6,7 +6,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-static mut INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 #[allow(unused)]
 #[cfg(unix)]
@@ -30,5 +30,5 @@ pub fn register_sigint() {
 }
 
 pub fn was_interrupted() -> bool {
-    unsafe { INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) }
+    INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed)
 }

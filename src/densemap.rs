@@ -52,7 +52,7 @@ impl<K: Index, V> DenseMap<K, V> {
         id
     }
 
-    pub fn iter(&self) -> std::slice::Iter<V> {
+    pub fn iter(&self) -> std::slice::Iter<'_, V> {
         self.vec.iter()
     }
 }

@@ -100,7 +100,7 @@ struct Args {
     chdir: Option<String>,
 
     /// input build file [default=build.ninja]
-    #[argh(option, short = 'f', default = "(\"build.ninja\".into())")]
+    #[argh(option, short = 'f', default = "\"build.ninja\".into()")]
     build_file: String,
 
     /// debugging tools
