@@ -71,6 +71,8 @@ pub struct DumbConsoleProgress {
     /// The id of the last command printed, used to avoid printing it twice
     /// when we have two updates from the same command in a row.
     last_started: Option<BuildId>,
+
+    /// A callback to invoke for each log line, instead of printing to stdout.
     callback: Option<Box<dyn Fn(&str) + Send>>,
 }
 
@@ -257,6 +259,7 @@ struct FancyState {
     tasks: VecDeque<Task>,
     /// Whether to print command lines of started programs.
     verbose: bool,
+    /// A callback to invoke for each log line, instead of printing to stdout.
     callback: Option<Box<dyn Fn(&str) + Send>>,
 }
 

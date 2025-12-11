@@ -308,7 +308,10 @@ impl BuildStates {
 
 #[derive(Clone)]
 pub struct Options {
+    /// Number of failures to tolerate before aborting the build.
+    /// None means unlimited.
     pub failures_left: Option<usize>,
+    /// The max amount of tasks that can be run simultaneously.
     pub parallelism: usize,
     /// When true, verbosely explain why targets are considered dirty.
     pub explain: bool,
