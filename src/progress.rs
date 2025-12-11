@@ -305,15 +305,15 @@ impl FancyState {
                 build_message(build, true)
             )),
             Termination::Failure => {
-                // Show failed message, with command line if in verbose mode.
+                // Show the failure message with command line if in verbose mode.
+                // If not verbose, there will be diagnostic output so no need
+                // to show the message here.
                 if self.verbose {
                     self.log_when_failed(&format!(
                         "{} {}",
                         "failed:".red().bold(),
                         build_message(build, true)
                     ))
-                } else {
-                    self.log_when_failed(&format!("{}", "failed".red().bold()))
                 }
             }
         };
