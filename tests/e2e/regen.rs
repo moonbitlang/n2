@@ -99,7 +99,8 @@ rule regen
 
     // Run: regenerate and fail.
     let out = space.run(&mut n2_command(vec!["out"]))?;
-    assert_output_contains(&out, "failed:");
+    assert_output_contains(&out, "sh ./gen.sh");
+    assert_output_not_contains(&out, "failed:");
 
     Ok(())
 }
