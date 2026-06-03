@@ -111,7 +111,12 @@ impl Progress for DumbConsoleProgress {
                 self.log_when_failed(&format!("interrupted: {}", build_message(build, true)))
             }
             Termination::Failure => {
-                self.log_when_failed(&format!("failed: {}", build_message(build, true)))
+                // Show the failure message with command line if in verbose mode.
+                // If not verbose, there will be diagnostic output so no need
+                // to show the message here.
+                if self.verbose {
+                    self.log_when_failed(&format!("failed: {}", build_message(build, true)))
+                }
             }
         };
         if !result.output.is_empty() {
