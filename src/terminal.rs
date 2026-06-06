@@ -1,7 +1,7 @@
 #[cfg(unix)]
 mod unix {
     pub fn use_fancy() -> bool {
-        if matches!(std::env::var("TERM").as_deref(), Ok("dumb")) {
+        if std::env::var("TERM").as_deref() == Ok("dumb") {
             return false;
         }
         unsafe {
