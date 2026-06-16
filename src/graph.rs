@@ -158,6 +158,9 @@ pub struct Build {
     /// Command line to run.  Absent for phony builds.
     pub cmdline: Option<String>,
 
+    /// Working directory for running the command, if specified.
+    pub cwd: Option<String>,
+
     /// Path to generated `.d` file, if any.
     pub depfile: Option<String>,
 
@@ -186,6 +189,7 @@ impl Build {
             location: loc,
             desc: None,
             cmdline: None,
+            cwd: None,
             depfile: None,
             parse_showincludes: false,
             rspfile: None,

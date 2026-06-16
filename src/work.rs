@@ -881,6 +881,7 @@ impl<'a> Work<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{path::Path, rc::Rc};
 
     #[test]
     fn build_cycle() -> Result<(), anyhow::Error> {
@@ -897,6 +898,86 @@ build c: phony a
             Ok(_) => panic!("expected build cycle error"),
             Err(err) => assert_eq!(err.to_string(), "dependency cycle: a -> b -> c -> a"),
         }
+        Ok(())
+    }
+
+    fn graph_with_cwd_build(work_dir: &Path, cwd_name: &str) -> anyhow::Result<(Graph, FileId)> {
+        let mut graph = Graph::default();
+        let out_path = work_dir.join("out").display().to_string();
+        let out = graph.files.id_from_canonical(out_path);
+        let mut build = Build::new(
+            FileLoc {
+                filename: Rc::new(Path::new("programmatic").to_path_buf()),
+                line: 1,
+            },
+            BuildIns {
+                ids: Vec::new(),
+                explicit: 0,
+                implicit: 0,
+                order_only: 0,
+            },
+            BuildOuts {
+                ids: vec![out],
+                explicit: 1,
+            },
+        );
+
+        #[cfg(unix)]
+        {
+            build.cmdline = Some("cat marker > ../out".to_owned());
+        }
+        #[cfg(windows)]
+        {
+            build.cmdline = Some("cmd /c type marker > ..\\out".to_owned());
+        }
+
+        build.cwd = Some(work_dir.join(cwd_name).display().to_string());
+        graph.add_build(build)?;
+        Ok((graph, out))
+    }
+
+    fn run_graph(graph: &mut Graph, db_path: &Path, out: FileId) -> anyhow::Result<()> {
+        let mut hashes = Hashes::default();
+        let db = db::open(db_path, graph, &mut hashes).map_err(anyhow::Error::from)?;
+        let options = Options {
+            failures_left: None,
+            parallelism: 1,
+            explain: false,
+            adopt: false,
+            dirty_on_output: false,
+        };
+        let mut progress = progress::DumbConsoleProgress::new(false, Some(Box::new(|_| {})));
+        let mut work = Work::new(
+            graph.clone(),
+            hashes,
+            db,
+            &options,
+            &mut progress,
+            SmallMap::default(),
+        );
+        work.want_file(out)?;
+        assert_eq!(work.run()?, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn programmatic_build_cwd_affects_execution_and_hash() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("sub"))?;
+        std::fs::create_dir(dir.path().join("other"))?;
+        std::fs::write(dir.path().join("sub").join("marker"), "sub")?;
+        std::fs::write(dir.path().join("other").join("marker"), "other")?;
+
+        let db_path = dir.path().join(".n2_db");
+
+        let (mut graph, out) = graph_with_cwd_build(dir.path(), "sub")?;
+        run_graph(&mut graph, &db_path, out)?;
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"sub");
+
+        let (mut graph, out) = graph_with_cwd_build(dir.path(), "other")?;
+        run_graph(&mut graph, &db_path, out)?;
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"other");
+
         Ok(())
     }
 }

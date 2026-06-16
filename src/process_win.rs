@@ -4,8 +4,10 @@
 use crate::process::Termination;
 use std::ffi::c_void;
 use std::io::Read;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::os::windows::prelude::AsRawHandle;
+use std::path::Path;
 use std::pin::{pin, Pin};
 use windows_sys::Win32::{
     Foundation::*,
@@ -153,7 +155,11 @@ impl<'a> Drop for ProcThreadAttributeList<'a> {
     }
 }
 
-pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::Result<Termination> {
+pub fn run_command(
+    cmdline: &str,
+    cwd: Option<&Path>,
+    mut output_cb: impl FnMut(&[u8]),
+) -> anyhow::Result<Termination> {
     // Don't want to run `cmd /c` since that limits cmd line length to 8192 bytes.
     // std::process::Command can't take a string and pass it through to CreateProcess unchanged,
     // so call that ourselves.
@@ -203,6 +209,14 @@ pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::R
 
         let mut cmdline_nul: Vec<u16> = cmdline.encode_utf16().collect();
         cmdline_nul.push(0);
+        let cwd_nul = cwd.map(|cwd| {
+            let mut cwd_nul: Vec<u16> = cwd.as_os_str().encode_wide().collect();
+            cwd_nul.push(0);
+            cwd_nul
+        });
+        let cwd_ptr = cwd_nul
+            .as_ref()
+            .map_or(std::ptr::null(), |cwd| cwd.as_ptr());
 
         if CreateProcessW(
             std::ptr::null_mut(),
@@ -212,7 +226,7 @@ pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::R
             /*inherit handles = */ TRUE,
             process_flags,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            cwd_ptr,
             &mut startup_info.StartupInfo,
             process_info.as_mut_ptr(),
         ) == 0
@@ -275,7 +289,9 @@ mod tests {
     #[test]
     fn run_echo() -> anyhow::Result<()> {
         let mut output = Vec::new();
-        run_command("cmd /c echo hello", |buf| output.extend_from_slice(buf))?;
+        run_command("cmd /c echo hello", None, |buf| {
+            output.extend_from_slice(buf)
+        })?;
         assert_eq!(output, b"hello\r\n");
         Ok(())
     }
@@ -284,8 +300,8 @@ mod tests {
     #[test]
     fn empty_command() -> anyhow::Result<()> {
         let mut output = Vec::new();
-        let err =
-            run_command("", |buf| output.extend_from_slice(buf)).expect_err("expected failure");
+        let err = run_command("", None, |buf| output.extend_from_slice(buf))
+            .expect_err("expected failure");
         assert!(err.to_string().contains("command is empty"));
         Ok(())
     }
@@ -294,8 +310,10 @@ mod tests {
     #[test]
     fn initial_space() -> anyhow::Result<()> {
         let mut output = Vec::new();
-        let err = run_command(" cmd /c echo hello", |buf| output.extend_from_slice(buf))
-            .expect_err("expected failure");
+        let err = run_command(" cmd /c echo hello", None, |buf| {
+            output.extend_from_slice(buf)
+        })
+        .expect_err("expected failure");
         assert!(err.to_string().contains("command has leading whitespace"));
         Ok(())
     }
