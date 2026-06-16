@@ -121,6 +121,7 @@ fn find_last_line(buf: &[u8]) -> &[u8] {
 /// here.
 fn run_task(
     cmdline: &str,
+    cwd: Option<&Path>,
     depfile: Option<&Path>,
     parse_showincludes: bool,
     rspfile: Option<&RspFile>,
@@ -136,7 +137,7 @@ fn run_task(
     let termination = {
         let exec_span = tracing::info_span!("task.exec");
         let _exec_enter = exec_span.enter();
-        process::run_command(cmdline, |buf| {
+        process::run_command(cmdline, cwd, |buf| {
             output.extend_from_slice(buf);
             last_line_cb(find_last_line(&output));
         })?
@@ -291,6 +292,7 @@ impl Runner {
 
     pub fn start(&mut self, id: BuildId, build: &Build) {
         let cmdline = build.cmdline.clone().unwrap();
+        let cwd = build.cwd.clone().map(PathBuf::from);
         let depfile = build.depfile.clone().map(PathBuf::from);
         let rspfile = build.rspfile.clone();
         let parse_showincludes = build.parse_showincludes;
@@ -310,6 +312,7 @@ impl Runner {
                 let start = Instant::now();
                 let result = run_task(
                     &cmdline,
+                    cwd.as_deref(),
                     depfile.as_deref(),
                     parse_showincludes,
                     rspfile.as_ref(),

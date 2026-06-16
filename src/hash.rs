@@ -30,6 +30,7 @@ trait Manifest {
     );
     fn write_rsp(&mut self, rspfile: &RspFile);
     fn write_cmdline(&mut self, cmdline: &str);
+    fn write_cwd(&mut self, cwd: &str);
 }
 
 fn get_fileid_status<'a>(
@@ -89,6 +90,11 @@ impl Manifest for TerseHash {
         self.write_separator();
     }
 
+    fn write_cwd(&mut self, cwd: &str) {
+        self.write_string(cwd);
+        self.write_separator();
+    }
+
     fn write_rsp(&mut self, rspfile: &RspFile) {
         rspfile.hash(&mut self.0);
     }
@@ -103,6 +109,9 @@ fn build_manifest<M: Manifest>(
     manifest.write_files("in", files, file_state, build.dirtying_ins());
     manifest.write_files("discovered", files, file_state, build.discovered_ins());
     manifest.write_cmdline(build.cmdline.as_deref().unwrap_or(""));
+    if let Some(cwd) = &build.cwd {
+        manifest.write_cwd(cwd);
+    }
     if let Some(rspfile) = &build.rspfile {
         manifest.write_rsp(rspfile);
     }
@@ -154,6 +163,10 @@ impl Manifest for ExplainHash {
 
     fn write_cmdline(&mut self, cmdline: &str) {
         writeln!(&mut self.text, "cmdline: {}", cmdline).unwrap();
+    }
+
+    fn write_cwd(&mut self, cwd: &str) {
+        writeln!(&mut self.text, "cwd: {}", cwd).unwrap();
     }
 }
 

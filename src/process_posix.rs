@@ -4,12 +4,25 @@
 use crate::process::Termination;
 use std::io::{Error, Read};
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 
 // https://github.com/rust-lang/libc/issues/2520
 // libc crate doesn't expose the 'environ' pointer.
 extern "C" {
     static environ: *const *mut libc::c_char;
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    // libc does not expose this Apple extension. Apple added a non-_np
+    // replacement in newer SDKs, but this older symbol keeps cwd support
+    // working on older macOS runtimes too.
+    fn posix_spawn_file_actions_addchdir_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        path: *const libc::c_char,
+    ) -> libc::c_int;
 }
 
 fn check_posix_spawn(func: &str, ret: libc::c_int) -> anyhow::Result<()> {
@@ -124,6 +137,17 @@ impl PosixSpawnFileActions {
             )
         }
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn addchdir(&mut self, path: &std::ffi::CStr) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        let ret =
+            unsafe { libc::posix_spawn_file_actions_addchdir_np(self.as_ptr(), path.as_ptr()) };
+        #[cfg(target_os = "macos")]
+        let ret = unsafe { posix_spawn_file_actions_addchdir_np(self.as_ptr(), path.as_ptr()) };
+
+        check_posix_spawn("posix_spawn_file_actions_addchdir_np", ret)
+    }
 }
 
 impl Drop for PosixSpawnFileActions {
@@ -151,7 +175,11 @@ fn pipe2() -> anyhow::Result<[libc::c_int; 2]> {
     }
 }
 
-pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::Result<Termination> {
+pub fn run_command(
+    cmdline: &str,
+    cwd: Option<&Path>,
+    mut output_cb: impl FnMut(&[u8]),
+) -> anyhow::Result<Termination> {
     // Spawn the subprocess using posix_spawn with output redirected to the pipe.
     // We don't use Rust's process spawning because of issue #14 and because
     // we want to feed both stdout and stderr into the same pipe, which cannot
@@ -180,6 +208,17 @@ pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::R
         actions.addclose(pipe[0])?;
         actions.addclose(pipe[1])?;
 
+        let cwd_nul = if let Some(cwd) = cwd {
+            let cwd_nul = std::ffi::CString::new(cwd.as_os_str().as_bytes())?;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            actions.addchdir(&cwd_nul)?;
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            anyhow::bail!("cwd is not supported on this Unix platform");
+            Some(cwd_nul)
+        } else {
+            None
+        };
+
         let mut pid: libc::pid_t = 0;
         let path = std::ffi::CStr::from_bytes_with_nul_unchecked(b"/bin/sh\0");
         let cmdline_nul = std::ffi::CString::new(cmdline).unwrap();
@@ -203,6 +242,7 @@ pub fn run_command(cmdline: &str, mut output_cb: impl FnMut(&[u8])) -> anyhow::R
                 environ,
             ),
         )?;
+        drop(cwd_nul);
 
         check_ret_errno("close", libc::close(pipe[1]))?;
 
