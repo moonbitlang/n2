@@ -32,6 +32,9 @@ mod windows {
     use windows_sys::Win32::{Foundation::*, System::Console::*};
 
     pub fn use_fancy() -> bool {
+        if std::env::var("TERM").as_deref() == Ok("dumb") {
+            return false;
+        }
         unsafe {
             let handle = GetStdHandle(STD_OUTPUT_HANDLE);
             let mut mode = 0;
