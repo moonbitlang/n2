@@ -4,9 +4,12 @@
 use crate::process::Termination;
 use std::io::{Error, Read};
 use std::os::fd::FromRawFd;
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
+#[cfg(not(target_os = "macos"))]
+use std::process::{Command, Stdio};
 
 // https://github.com/rust-lang/libc/issues/2520
 // libc crate doesn't expose the 'environ' pointer.
@@ -138,14 +141,9 @@ impl PosixSpawnFileActions {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     fn addchdir(&mut self, path: &std::ffi::CStr) -> anyhow::Result<()> {
-        #[cfg(target_os = "linux")]
-        let ret =
-            unsafe { libc::posix_spawn_file_actions_addchdir_np(self.as_ptr(), path.as_ptr()) };
-        #[cfg(target_os = "macos")]
         let ret = unsafe { posix_spawn_file_actions_addchdir_np(self.as_ptr(), path.as_ptr()) };
-
         check_posix_spawn("posix_spawn_file_actions_addchdir_np", ret)
     }
 }
@@ -180,6 +178,13 @@ pub fn run_command(
     cwd: Option<&Path>,
     mut output_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<Termination> {
+    #[cfg(not(target_os = "macos"))]
+    if let Some(cwd) = cwd {
+        // Portable spawn chdir actions are not available on older libcs, so
+        // let std handle the cwd-specific spawn path.
+        return run_command_with_std_process(cmdline, cwd, output_cb);
+    }
+
     // Spawn the subprocess using posix_spawn with output redirected to the pipe.
     // We don't use Rust's process spawning because of issue #14 and because
     // we want to feed both stdout and stderr into the same pipe, which cannot
@@ -208,16 +213,11 @@ pub fn run_command(
         actions.addclose(pipe[0])?;
         actions.addclose(pipe[1])?;
 
-        let cwd_nul = if let Some(cwd) = cwd {
+        #[cfg(target_os = "macos")]
+        if let Some(cwd) = cwd {
             let cwd_nul = std::ffi::CString::new(cwd.as_os_str().as_bytes())?;
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             actions.addchdir(&cwd_nul)?;
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            anyhow::bail!("cwd is not supported on this Unix platform");
-            Some(cwd_nul)
-        } else {
-            None
-        };
+        }
 
         let mut pid: libc::pid_t = 0;
         let path = std::ffi::CStr::from_bytes_with_nul_unchecked(b"/bin/sh\0");
@@ -242,8 +242,6 @@ pub fn run_command(
                 environ,
             ),
         )?;
-        drop(cwd_nul);
-
         check_ret_errno("close", libc::close(pipe[1]))?;
 
         (pid, std::fs::File::from_raw_fd(pipe[0]))
@@ -265,6 +263,65 @@ pub fn run_command(
         std::process::ExitStatus::from_raw(status)
     };
 
+    let termination = if status.success() {
+        Termination::Success
+    } else if let Some(sig) = status.signal() {
+        match sig {
+            libc::SIGINT => {
+                output_cb("interrupted".as_bytes());
+                Termination::Interrupted
+            }
+            _ => {
+                output_cb(format!("signal {}", sig).as_bytes());
+                Termination::Failure
+            }
+        }
+    } else {
+        Termination::Failure
+    };
+
+    Ok(termination)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_command_with_std_process(
+    cmdline: &str,
+    cwd: &Path,
+    mut output_cb: impl FnMut(&[u8]),
+) -> anyhow::Result<Termination> {
+    let pipe = pipe2()?;
+    let stderr_fd = unsafe { libc::fcntl(pipe[1], libc::F_DUPFD_CLOEXEC, 3) };
+    if stderr_fd < 0 {
+        let err = Error::last_os_error();
+        let _ = unsafe { libc::close(pipe[0]) };
+        let _ = unsafe { libc::close(pipe[1]) };
+        return Err(err.into());
+    }
+
+    let mut pipe_read = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+    let stdout = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
+    let stderr = unsafe { std::fs::File::from_raw_fd(stderr_fd) };
+
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmdline)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
+
+    let mut buf: [u8; 4 << 10] = [0; 4 << 10];
+    loop {
+        let n = pipe_read.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        output_cb(&buf[0..n]);
+    }
+    drop(pipe_read);
+
+    let status = child.wait()?;
     let termination = if status.success() {
         Termination::Success
     } else if let Some(sig) = status.signal() {
