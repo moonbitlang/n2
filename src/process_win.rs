@@ -16,9 +16,9 @@ use windows_sys::Win32::{
 };
 
 fn get_error_string(err: u32) -> String {
-    let mut buf: [u8; 1024] = [0; 1024];
+    let mut buf: [u16; 1024] = [0; 1024];
     let len = unsafe {
-        FormatMessageA(
+        FormatMessageW(
             FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
             std::ptr::null(),
             err,
@@ -29,9 +29,9 @@ fn get_error_string(err: u32) -> String {
         )
     };
     if len == 0 {
-        panic!("FormatMessageA on error failed: {}", err);
+        panic!("FormatMessageW on error failed: {}", err);
     }
-    std::str::from_utf8(&buf[..len as usize])
+    String::from_utf16(&buf[..len as usize])
         .unwrap()
         .trim_end()
         .to_owned()
@@ -316,5 +316,17 @@ mod tests {
         .expect_err("expected failure");
         assert!(err.to_string().contains("command has leading whitespace"));
         Ok(())
+    }
+
+    /// Missing commands should report a normal Windows error, not panic while
+    /// decoding localized OS error text.
+    #[test]
+    fn missing_command() {
+        let mut output = Vec::new();
+        let err = run_command("command_not_exits", None, |buf| {
+            output.extend_from_slice(buf)
+        })
+        .expect_err("expected failure");
+        assert!(err.to_string().contains("CreateProcessW"));
     }
 }
