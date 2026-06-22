@@ -37,7 +37,7 @@ pub struct TaskResult {
 }
 
 /// Reads dependencies from a .d file path.
-fn read_depfile(path: &Path) -> anyhow::Result<Vec<String>> {
+fn read_depfile(path: &Path, cwd: Option<&Path>) -> anyhow::Result<Vec<String>> {
     let bytes = match scanner::read_file_with_nul(path) {
         Ok(b) => b,
         // See discussion of missing depfiles in #80.
@@ -56,17 +56,44 @@ fn read_depfile(path: &Path) -> anyhow::Result<Vec<String>> {
     let deps: Vec<String> = parsed_deps
         .values()
         .flat_map(|x| x.iter())
-        .map(|&dep| dep.to_owned())
+        .map(|&dep| resolve_discovered_dep(cwd, dep))
         .collect();
     tracing::info!(path = %path.display(), deps_count = deps.len(), "read depfile");
     Ok(deps)
 }
 
-fn write_rspfile(rspfile: &RspFile) -> anyhow::Result<()> {
-    if let Some(parent) = rspfile.path.parent() {
+fn resolve_task_path(cwd: Option<&Path>, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match cwd {
+        Some(cwd) => cwd.join(path),
+        None => path.to_path_buf(),
+    }
+}
+
+fn resolve_discovered_dep(cwd: Option<&Path>, dep: &str) -> String {
+    let path = Path::new(dep);
+    if path.is_absolute() {
+        return dep.to_owned();
+    }
+    match cwd {
+        Some(cwd) => cwd.join(path).display().to_string(),
+        None => dep.to_owned(),
+    }
+}
+
+fn write_rspfile(cwd: Option<&Path>, rspfile: &RspFile) -> anyhow::Result<()> {
+    let path = resolve_task_path(cwd, &rspfile.path);
+    if let Some(parent) = rspfile
+        .path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let parent = resolve_task_path(cwd, parent);
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&rspfile.path, &rspfile.content)?;
+    std::fs::write(path, &rspfile.content)?;
     Ok(())
 }
 
@@ -130,7 +157,7 @@ fn run_task(
     if let Some(rspfile) = rspfile {
         let rsp_span = tracing::info_span!("task.write_rspfile");
         let _rsp_enter = rsp_span.enter();
-        write_rspfile(rspfile)?;
+        write_rspfile(cwd, rspfile)?;
     }
 
     let mut output = Vec::new();
@@ -150,14 +177,20 @@ fn run_task(
         // Remove /showIncludes lines from output, regardless of success/fail.
         let (includes, filtered) = extract_showincludes(output);
         output = filtered;
-        discovered_deps = Some(includes);
+        discovered_deps = Some(
+            includes
+                .iter()
+                .map(|include| resolve_discovered_dep(cwd, include))
+                .collect(),
+        );
     }
     if termination == process::Termination::Success {
         if let Some(depfile) = depfile {
+            let depfile = resolve_task_path(cwd, depfile);
             let read_span =
                 tracing::info_span!("task.read_depfile", deps_count = tracing::field::Empty);
             let _read_enter = read_span.enter();
-            let deps = read_depfile(depfile)?;
+            let deps = read_depfile(&depfile, cwd)?;
             read_span.record("deps_count", &tracing::field::display(deps.len()));
             discovered_deps = Some(deps);
         }
@@ -398,7 +431,7 @@ more text
 
     #[test]
     fn missing_depfile_allowed() {
-        let deps = read_depfile(Path::new("/missing/dep/file")).unwrap();
+        let deps = read_depfile(Path::new("/missing/dep/file"), None).unwrap();
         assert_eq!(deps.len(), 0);
     }
 }

@@ -936,6 +936,52 @@ build c: phony a
         Ok((graph, out))
     }
 
+    fn graph_with_cwd_side_files_build(work_dir: &Path) -> anyhow::Result<(Graph, FileId)> {
+        let mut graph = Graph::default();
+        let out_path = work_dir.join("out").display().to_string();
+        let out = graph.files.id_from_canonical(out_path);
+        let mut build = Build::new(
+            FileLoc {
+                filename: Rc::new(Path::new("programmatic").to_path_buf()),
+                line: 1,
+            },
+            BuildIns {
+                ids: Vec::new(),
+                explicit: 0,
+                implicit: 0,
+                order_only: 0,
+            },
+            BuildOuts {
+                ids: vec![out],
+                explicit: 1,
+            },
+        );
+
+        #[cfg(unix)]
+        {
+            build.cmdline = Some(
+                "cat args.rsp > /dev/null && cat marker header > ../out && printf '../out: header\\n' > out.d"
+                    .to_owned(),
+            );
+        }
+        #[cfg(windows)]
+        {
+            build.cmdline = Some(
+                "cmd /c type args.rsp > nul && type marker header > ..\\out && echo ..\\out: header > out.d"
+                    .to_owned(),
+            );
+        }
+
+        build.cwd = Some(work_dir.join("sub").display().to_string());
+        build.depfile = Some("out.d".to_owned());
+        build.rspfile = Some(RspFile {
+            path: Path::new("args.rsp").to_path_buf(),
+            content: "unused".to_owned(),
+        });
+        graph.add_build(build)?;
+        Ok((graph, out))
+    }
+
     fn run_graph(graph: &mut Graph, db_path: &Path, out: FileId) -> anyhow::Result<()> {
         let mut hashes = Hashes::default();
         let db = db::open(db_path, graph, &mut hashes).map_err(anyhow::Error::from)?;
@@ -977,6 +1023,30 @@ build c: phony a
         let (mut graph, out) = graph_with_cwd_build(dir.path(), "other")?;
         run_graph(&mut graph, &db_path, out)?;
         assert_eq!(std::fs::read(dir.path().join("out"))?, b"other");
+
+        Ok(())
+    }
+
+    #[test]
+    fn programmatic_build_cwd_resolves_relative_task_files() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cwd = dir.path().join("sub");
+        std::fs::create_dir(&cwd)?;
+        std::fs::write(cwd.join("marker"), "marker")?;
+        std::fs::write(cwd.join("header"), "v1")?;
+
+        let db_path = dir.path().join(".n2_db");
+
+        let (mut graph, out) = graph_with_cwd_side_files_build(dir.path())?;
+        run_graph(&mut graph, &db_path, out)?;
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"markerv1");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(cwd.join("header"), "v2")?;
+
+        let (mut graph, out) = graph_with_cwd_side_files_build(dir.path())?;
+        run_graph(&mut graph, &db_path, out)?;
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"markerv2");
 
         Ok(())
     }
