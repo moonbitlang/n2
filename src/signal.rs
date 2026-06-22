@@ -6,14 +6,12 @@
 
 use std::sync::atomic::AtomicBool;
 
-static mut INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 #[allow(unused)]
 #[cfg(unix)]
 extern "C" fn sigint_handler(_sig: libc::c_int) {
-    unsafe {
-        INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
+    INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
     // SA_RESETHAND should clear the handler.
 }
 
@@ -30,5 +28,5 @@ pub fn register_sigint() {
 }
 
 pub fn was_interrupted() -> bool {
-    unsafe { INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) }
+    INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed)
 }
