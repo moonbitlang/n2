@@ -4,7 +4,6 @@
 use crate::process::Termination;
 use std::io::{Error, Read};
 use std::os::fd::FromRawFd;
-#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -41,6 +40,21 @@ fn check_ret_errno(func: &str, ret: libc::c_int) -> anyhow::Result<()> {
         let errno = Error::last_os_error().raw_os_error().unwrap();
         let err_str = unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno)) };
         anyhow::bail!("{}: {}", func, err_str.to_str().unwrap());
+    }
+    Ok(())
+}
+
+fn validate_env(env: &[(String, String)]) -> anyhow::Result<()> {
+    for (key, value) in env {
+        if key.is_empty() {
+            anyhow::bail!("environment variable name is empty");
+        }
+        if key.contains('=') {
+            anyhow::bail!("environment variable name {:?} contains '='", key);
+        }
+        if key.contains('\0') || value.contains('\0') {
+            anyhow::bail!("environment variable {:?} contains NUL", key);
+        }
     }
     Ok(())
 }
@@ -154,6 +168,69 @@ impl Drop for PosixSpawnFileActions {
     }
 }
 
+struct Envp {
+    /// Owns the strings that `ptrs` points into.
+    storage: Vec<std::ffi::CString>,
+    ptrs: Vec<*mut libc::c_char>,
+}
+
+impl Envp {
+    fn new(env: &[(String, String)]) -> anyhow::Result<Option<Self>> {
+        if env.is_empty() {
+            return Ok(None);
+        }
+
+        validate_env(env)?;
+
+        let mut vars: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
+            .map(|(key, value)| {
+                (
+                    key.as_os_str().as_bytes().to_vec(),
+                    value.as_os_str().as_bytes().to_vec(),
+                )
+            })
+            .collect();
+
+        for (key, value) in env {
+            let key = key.as_bytes();
+            let value = value.as_bytes();
+            if let Some((_, existing_value)) = vars
+                .iter_mut()
+                .find(|(existing_key, _)| existing_key == key)
+            {
+                *existing_value = value.to_vec();
+            } else {
+                vars.push((key.to_vec(), value.to_vec()));
+            }
+        }
+
+        let vars: Vec<std::ffi::CString> = vars
+            .into_iter()
+            .map(|(key, value)| {
+                let mut entry = Vec::with_capacity(key.len() + value.len() + 1);
+                entry.extend_from_slice(&key);
+                entry.push(b'=');
+                entry.extend_from_slice(&value);
+                std::ffi::CString::new(entry)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut ptrs: Vec<*mut libc::c_char> =
+            vars.iter().map(|var| var.as_ptr() as *mut _).collect();
+        ptrs.push(std::ptr::null_mut());
+
+        Ok(Some(Envp {
+            storage: vars,
+            ptrs,
+        }))
+    }
+
+    fn as_ptr(&self) -> *const *mut libc::c_char {
+        debug_assert_eq!(self.ptrs.len(), self.storage.len() + 1);
+        self.ptrs.as_ptr()
+    }
+}
+
 /// Create an anonymous pipe as in libc::pipe(), but using pipe2() when available
 /// to set CLOEXEC flag.
 fn pipe2() -> anyhow::Result<[libc::c_int; 2]> {
@@ -176,19 +253,21 @@ fn pipe2() -> anyhow::Result<[libc::c_int; 2]> {
 pub fn run_command(
     cmdline: &str,
     cwd: Option<&Path>,
+    env: &[(String, String)],
     mut output_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<Termination> {
     #[cfg(not(target_os = "macos"))]
     if let Some(cwd) = cwd {
         // Portable spawn chdir actions are not available on older libcs, so
         // let std handle the cwd-specific spawn path.
-        return run_command_with_std_process(cmdline, cwd, output_cb);
+        return run_command_with_std_process(cmdline, cwd, env, output_cb);
     }
 
     // Spawn the subprocess using posix_spawn with output redirected to the pipe.
     // We don't use Rust's process spawning because of issue #14 and because
     // we want to feed both stdout and stderr into the same pipe, which cannot
     // be done with the existing std::process API.
+    let envp = Envp::new(env)?;
     let (pid, mut pipe) = unsafe {
         let pipe = pipe2()?;
 
@@ -219,6 +298,8 @@ pub fn run_command(
             actions.addchdir(&cwd_nul)?;
         }
 
+        let envp_ptr = envp.as_ref().map_or(environ, |envp| envp.as_ptr());
+
         let mut pid: libc::pid_t = 0;
         let path = std::ffi::CStr::from_bytes_with_nul_unchecked(b"/bin/sh\0");
         let cmdline_nul = std::ffi::CString::new(cmdline).unwrap();
@@ -239,7 +320,7 @@ pub fn run_command(
                 // posix_spawn wants mutable argv:
                 // https://stackoverflow.com/questions/50596439/can-string-literals-be-passed-in-posix-spawns-argv
                 argv.as_ptr() as *const *mut _,
-                environ,
+                envp_ptr,
             ),
         )?;
         check_ret_errno("close", libc::close(pipe[1]))?;
@@ -283,12 +364,87 @@ pub fn run_command(
     Ok(termination)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_invalid_env_rejected(cwd: Option<&Path>) {
+        for (env, expected) in [
+            (
+                vec![("".to_owned(), "value".to_owned())],
+                "environment variable name is empty",
+            ),
+            (vec![("A=B".to_owned(), "value".to_owned())], "contains '='"),
+            (
+                vec![("N2_PROCESS_TEST_ENV".to_owned(), "value\0tail".to_owned())],
+                "contains NUL",
+            ),
+        ] {
+            let mut output = Vec::new();
+            let err = run_command("printf unexpected", cwd, &env, |buf| {
+                output.extend_from_slice(buf)
+            })
+            .expect_err("expected invalid environment entry");
+            assert!(
+                err.to_string().contains(expected),
+                "expected error containing {:?}, got {}",
+                expected,
+                err
+            );
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn command_env() -> anyhow::Result<()> {
+        let mut output = Vec::new();
+        let env = [("N2_PROCESS_TEST_ENV".to_owned(), "hello".to_owned())];
+        run_command("printf %s \"$N2_PROCESS_TEST_ENV\"", None, &env, |buf| {
+            output.extend_from_slice(buf)
+        })?;
+        assert_eq!(output, b"hello");
+        Ok(())
+    }
+
+    #[test]
+    fn command_env_rejects_invalid_entries() {
+        assert_invalid_env_rejected(None);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn command_env_with_cwd() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut output = Vec::new();
+        let env = [("N2_PROCESS_TEST_ENV".to_owned(), "hello".to_owned())];
+        run_command(
+            "printf %s \"$N2_PROCESS_TEST_ENV\"",
+            Some(dir.path()),
+            &env,
+            |buf| output.extend_from_slice(buf),
+        )?;
+        assert_eq!(output, b"hello");
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn command_env_with_cwd_rejects_invalid_entries() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert_invalid_env_rejected(Some(dir.path()));
+        Ok(())
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn run_command_with_std_process(
     cmdline: &str,
     cwd: &Path,
+    env: &[(String, String)],
     mut output_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<Termination> {
+    validate_env(env)?;
+
     let pipe = pipe2()?;
     let stderr_fd = unsafe { libc::fcntl(pipe[1], libc::F_DUPFD_CLOEXEC, 3) };
     if stderr_fd < 0 {
@@ -306,6 +462,7 @@ fn run_command_with_std_process(
         .arg("-c")
         .arg(cmdline)
         .current_dir(cwd)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))

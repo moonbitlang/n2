@@ -161,6 +161,9 @@ pub struct Build {
     /// Working directory for running the command, if specified.
     pub cwd: Option<String>,
 
+    /// Environment variables to add or override when running the command.
+    pub env: Vec<(String, String)>,
+
     /// Path to generated `.d` file, if any.
     pub depfile: Option<String>,
 
@@ -190,6 +193,7 @@ impl Build {
             desc: None,
             cmdline: None,
             cwd: None,
+            env: Vec::new(),
             depfile: None,
             parse_showincludes: false,
             rspfile: None,

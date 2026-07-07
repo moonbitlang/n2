@@ -155,9 +155,56 @@ impl<'a> Drop for ProcThreadAttributeList<'a> {
     }
 }
 
+fn make_environment_block(env: &[(String, String)]) -> anyhow::Result<Option<Vec<u16>>> {
+    if env.is_empty() {
+        return Ok(None);
+    }
+
+    let mut vars = std::collections::BTreeMap::<String, (Vec<u16>, Vec<u16>)>::new();
+    for (key, value) in std::env::vars_os() {
+        let normalized_key = key.to_string_lossy().to_uppercase();
+        vars.insert(
+            normalized_key,
+            (
+                key.as_os_str().encode_wide().collect(),
+                value.as_os_str().encode_wide().collect(),
+            ),
+        );
+    }
+
+    for (key, value) in env {
+        if key.is_empty() {
+            anyhow::bail!("environment variable name is empty");
+        }
+        if key.contains('=') {
+            anyhow::bail!("environment variable name {:?} contains '='", key);
+        }
+        if key.contains('\0') || value.contains('\0') {
+            anyhow::bail!("environment variable {:?} contains NUL", key);
+        }
+
+        vars.insert(
+            key.to_uppercase(),
+            (key.encode_utf16().collect(), value.encode_utf16().collect()),
+        );
+    }
+
+    let mut block = Vec::new();
+    for (_, (key, value)) in vars {
+        block.extend(key);
+        block.push('=' as u16);
+        block.extend(value);
+        block.push(0);
+    }
+    block.push(0);
+
+    Ok(Some(block))
+}
+
 pub fn run_command(
     cmdline: &str,
     cwd: Option<&Path>,
+    env: &[(String, String)],
     mut output_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<Termination> {
     // Don't want to run `cmd /c` since that limits cmd line length to 8192 bytes.
@@ -188,7 +235,14 @@ pub fn run_command(
 
     let process_info = unsafe {
         // TODO: Set this to just 0 for console pool jobs.
-        let process_flags = CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT;
+        let env_block = make_environment_block(env)?;
+        let process_flags = CREATE_NEW_PROCESS_GROUP
+            | EXTENDED_STARTUPINFO_PRESENT
+            | if env_block.is_some() {
+                CREATE_UNICODE_ENVIRONMENT
+            } else {
+                0
+            };
 
         let mut startup_info = std::mem::zeroed::<STARTUPINFOEXW>();
         startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -217,7 +271,16 @@ pub fn run_command(
         let cwd_ptr = cwd_nul
             .as_ref()
             .map_or(std::ptr::null(), |cwd| cwd.as_ptr());
+        let env_ptr = env_block
+            .as_ref()
+            .map_or(std::ptr::null(), |env| env.as_ptr() as *const c_void);
 
+        // The explicit environment block is the child's environment; it is not
+        // a request for CreateProcessW to resolve a bare executable from that
+        // block's PATH. Do not pre-search PATH here: this is a build-system
+        // spawn path, so command strings may refer to tools or paths whose
+        // existence is controlled by the build graph. Callers that need custom
+        // lookup semantics should pass an explicit path or route through a shell.
         if CreateProcessW(
             std::ptr::null_mut(),
             cmdline_nul.as_mut_ptr(),
@@ -225,7 +288,7 @@ pub fn run_command(
             std::ptr::null_mut(),
             /*inherit handles = */ TRUE,
             process_flags,
-            std::ptr::null_mut(),
+            env_ptr,
             cwd_ptr,
             &mut startup_info.StartupInfo,
             process_info.as_mut_ptr(),
@@ -289,7 +352,7 @@ mod tests {
     #[test]
     fn run_echo() -> anyhow::Result<()> {
         let mut output = Vec::new();
-        run_command("cmd /c echo hello", None, |buf| {
+        run_command("cmd /c echo hello", None, &[], |buf| {
             output.extend_from_slice(buf)
         })?;
         assert_eq!(output, b"hello\r\n");
@@ -300,7 +363,7 @@ mod tests {
     #[test]
     fn empty_command() -> anyhow::Result<()> {
         let mut output = Vec::new();
-        let err = run_command("", None, |buf| output.extend_from_slice(buf))
+        let err = run_command("", None, &[], |buf| output.extend_from_slice(buf))
             .expect_err("expected failure");
         assert!(err.to_string().contains("command is empty"));
         Ok(())
@@ -310,7 +373,7 @@ mod tests {
     #[test]
     fn initial_space() -> anyhow::Result<()> {
         let mut output = Vec::new();
-        let err = run_command(" cmd /c echo hello", None, |buf| {
+        let err = run_command(" cmd /c echo hello", None, &[], |buf| {
             output.extend_from_slice(buf)
         })
         .expect_err("expected failure");
@@ -323,10 +386,21 @@ mod tests {
     #[test]
     fn missing_command() {
         let mut output = Vec::new();
-        let err = run_command("command_not_exits", None, |buf| {
+        let err = run_command("command_not_exits", None, &[], |buf| {
             output.extend_from_slice(buf)
         })
         .expect_err("expected failure");
         assert!(err.to_string().contains("CreateProcessW"));
+    }
+
+    #[test]
+    fn command_env() -> anyhow::Result<()> {
+        let mut output = Vec::new();
+        let env = [("N2_PROCESS_TEST_ENV".to_owned(), "hello".to_owned())];
+        run_command("cmd /c echo %N2_PROCESS_TEST_ENV%", None, &env, |buf| {
+            output.extend_from_slice(buf)
+        })?;
+        assert_eq!(output, b"hello\r\n");
+        Ok(())
     }
 }

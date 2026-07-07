@@ -94,18 +94,18 @@ impl Loader {
     fn add_build(
         &mut self,
         filename: std::rc::Rc<PathBuf>,
-        env: &eval::Vars,
+        globals: &eval::Vars,
         b: parse::Build,
     ) -> anyhow::Result<()> {
         let ins = graph::BuildIns {
-            ids: self.evaluate_paths(b.ins, &[&b.vars, env]),
+            ids: self.evaluate_paths(b.ins, &[&b.vars, globals]),
             explicit: b.explicit_ins,
             implicit: b.implicit_ins,
             order_only: b.order_only_ins,
             // validation is implied by the other counts
         };
         let outs = graph::BuildOuts {
-            ids: self.evaluate_paths(b.outs, &[&b.vars, env]),
+            ids: self.evaluate_paths(b.outs, &[&b.vars, globals]),
             explicit: b.explicit_outs,
         };
         let mut build = graph::Build::new(
@@ -132,8 +132,8 @@ impl Loader {
         let lookup = |key: &str| -> Option<String> {
             // Look up `key = ...` binding in build and rule block.
             Some(match rule.get(key) {
-                Some(val) => val.evaluate(&[&implicit_vars, build_vars, env]),
-                None => build_vars.get(key)?.evaluate(&[env]),
+                Some(val) => val.evaluate(&[&implicit_vars, build_vars, globals]),
+                None => build_vars.get(key)?.evaluate(&[globals]),
             })
         };
 
