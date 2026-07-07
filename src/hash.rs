@@ -31,6 +31,7 @@ trait Manifest {
     fn write_rsp(&mut self, rspfile: &RspFile);
     fn write_cmdline(&mut self, cmdline: &str);
     fn write_cwd(&mut self, cwd: &str);
+    fn write_env(&mut self, env: &[(String, String)]);
 }
 
 fn get_fileid_status<'a>(
@@ -95,6 +96,16 @@ impl Manifest for TerseHash {
         self.write_separator();
     }
 
+    fn write_env(&mut self, env: &[(String, String)]) {
+        for (key, value) in env {
+            self.write_string(key);
+            self.write_separator();
+            self.write_string(value);
+            self.write_separator();
+        }
+        self.write_separator();
+    }
+
     fn write_rsp(&mut self, rspfile: &RspFile) {
         rspfile.hash(&mut self.0);
     }
@@ -111,6 +122,9 @@ fn build_manifest<M: Manifest>(
     manifest.write_cmdline(build.cmdline.as_deref().unwrap_or(""));
     if let Some(cwd) = &build.cwd {
         manifest.write_cwd(cwd);
+    }
+    if !build.env.is_empty() {
+        manifest.write_env(&build.env);
     }
     if let Some(rspfile) = &build.rspfile {
         manifest.write_rsp(rspfile);
@@ -167,6 +181,13 @@ impl Manifest for ExplainHash {
 
     fn write_cwd(&mut self, cwd: &str) {
         writeln!(&mut self.text, "cwd: {}", cwd).unwrap();
+    }
+
+    fn write_env(&mut self, env: &[(String, String)]) {
+        writeln!(&mut self.text, "env:").unwrap();
+        for (key, value) in env {
+            writeln!(&mut self.text, "  {key}={value}").unwrap();
+        }
     }
 }
 

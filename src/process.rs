@@ -9,6 +9,7 @@ pub use crate::process_win::run_command;
 pub fn run_command(
     _cmdline: &str,
     _cwd: Option<&std::path::Path>,
+    _env: &[(String, String)],
     _output_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<Termination> {
     anyhow::bail!("wasm cannot run commands");

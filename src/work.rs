@@ -982,6 +982,45 @@ build c: phony a
         Ok((graph, out))
     }
 
+    fn graph_with_env_build(work_dir: &Path, value: &str) -> anyhow::Result<(Graph, FileId)> {
+        let mut graph = Graph::default();
+        let out_path = work_dir.join("out").display().to_string();
+        let out = graph.files.id_from_canonical(out_path.clone());
+        let mut build = Build::new(
+            FileLoc {
+                filename: Rc::new(Path::new("programmatic").to_path_buf()),
+                line: 1,
+            },
+            BuildIns {
+                ids: Vec::new(),
+                explicit: 0,
+                implicit: 0,
+                order_only: 0,
+            },
+            BuildOuts {
+                ids: vec![out],
+                explicit: 1,
+            },
+        );
+
+        #[cfg(unix)]
+        {
+            build.cmdline = Some(format!(
+                "printf %s \"$N2_WORK_ENV\" > {out_path} && printf %s \"$N2_WORK_ENV\" >> {out_path}"
+            ));
+        }
+        #[cfg(windows)]
+        {
+            build.cmdline = Some(format!(
+                "cmd /c (echo %N2_WORK_ENV%)>{out_path}&&(echo %N2_WORK_ENV%)>>{out_path}"
+            ));
+        }
+
+        build.env = vec![("N2_WORK_ENV".to_owned(), value.to_owned())];
+        graph.add_build(build)?;
+        Ok((graph, out))
+    }
+
     fn run_graph(graph: &mut Graph, db_path: &Path, out: FileId) -> anyhow::Result<()> {
         let mut hashes = Hashes::default();
         let db = db::open(db_path, graph, &mut hashes).map_err(anyhow::Error::from)?;
@@ -1003,6 +1042,28 @@ build c: phony a
         );
         work.want_file(out)?;
         assert_eq!(work.run()?, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn programmatic_build_env_affects_execution_and_hash() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join(".n2_db");
+
+        let (mut graph, out) = graph_with_env_build(dir.path(), "one")?;
+        run_graph(&mut graph, &db_path, out)?;
+        #[cfg(unix)]
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"oneone");
+        #[cfg(windows)]
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"one\r\none\r\n");
+
+        let (mut graph, out) = graph_with_env_build(dir.path(), "two")?;
+        run_graph(&mut graph, &db_path, out)?;
+        #[cfg(unix)]
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"twotwo");
+        #[cfg(windows)]
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"two\r\ntwo\r\n");
+
         Ok(())
     }
 
