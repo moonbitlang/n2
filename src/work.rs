@@ -982,7 +982,11 @@ build c: phony a
         Ok((graph, out))
     }
 
-    fn graph_with_env_build(work_dir: &Path, value: &str) -> anyhow::Result<(Graph, FileId)> {
+    fn graph_with_env_build(
+        work_dir: &Path,
+        value: &str,
+        inherit_env: bool,
+    ) -> anyhow::Result<(Graph, FileId)> {
         let mut graph = Graph::default();
         let out_path = work_dir.join("out").display().to_string();
         let out = graph.files.id_from_canonical(out_path.clone());
@@ -1016,6 +1020,7 @@ build c: phony a
             ));
         }
 
+        build.inherit_env = inherit_env;
         build.env = vec![("N2_WORK_ENV".to_owned(), value.to_owned())];
         graph.add_build(build)?;
         Ok((graph, out))
@@ -1046,18 +1051,25 @@ build c: phony a
     }
 
     #[test]
-    fn programmatic_build_env_affects_execution_and_hash() -> anyhow::Result<()> {
+    fn programmatic_build_env_and_inheritance_affect_execution_and_hash() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join(".n2_db");
 
-        let (mut graph, out) = graph_with_env_build(dir.path(), "one")?;
+        let (mut graph, out) = graph_with_env_build(dir.path(), "one", true)?;
         run_graph(&mut graph, &db_path, out)?;
         #[cfg(unix)]
         assert_eq!(std::fs::read(dir.path().join("out"))?, b"oneone");
         #[cfg(windows)]
         assert_eq!(std::fs::read(dir.path().join("out"))?, b"one\r\none\r\n");
 
-        let (mut graph, out) = graph_with_env_build(dir.path(), "two")?;
+        let (mut graph, out) = graph_with_env_build(dir.path(), "two", true)?;
+        run_graph(&mut graph, &db_path, out)?;
+        #[cfg(unix)]
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"twotwo");
+        #[cfg(windows)]
+        assert_eq!(std::fs::read(dir.path().join("out"))?, b"two\r\ntwo\r\n");
+
+        let (mut graph, out) = graph_with_env_build(dir.path(), "two", false)?;
         run_graph(&mut graph, &db_path, out)?;
         #[cfg(unix)]
         assert_eq!(std::fs::read(dir.path().join("out"))?, b"twotwo");

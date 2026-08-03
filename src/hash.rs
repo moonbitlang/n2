@@ -31,6 +31,7 @@ trait Manifest {
     fn write_rsp(&mut self, rspfile: &RspFile);
     fn write_cmdline(&mut self, cmdline: &str);
     fn write_cwd(&mut self, cwd: &str);
+    fn write_inherit_env(&mut self, inherit_env: bool);
     fn write_env(&mut self, env: &[(String, String)]);
 }
 
@@ -96,6 +97,11 @@ impl Manifest for TerseHash {
         self.write_separator();
     }
 
+    fn write_inherit_env(&mut self, inherit_env: bool) {
+        inherit_env.hash(&mut self.0);
+        self.write_separator();
+    }
+
     fn write_env(&mut self, env: &[(String, String)]) {
         for (key, value) in env {
             self.write_string(key);
@@ -122,6 +128,10 @@ fn build_manifest<M: Manifest>(
     manifest.write_cmdline(build.cmdline.as_deref().unwrap_or(""));
     if let Some(cwd) = &build.cwd {
         manifest.write_cwd(cwd);
+    }
+    // Omit the default to preserve existing hashes for builds that inherit.
+    if !build.inherit_env {
+        manifest.write_inherit_env(build.inherit_env);
     }
     if !build.env.is_empty() {
         manifest.write_env(&build.env);
@@ -181,6 +191,10 @@ impl Manifest for ExplainHash {
 
     fn write_cwd(&mut self, cwd: &str) {
         writeln!(&mut self.text, "cwd: {}", cwd).unwrap();
+    }
+
+    fn write_inherit_env(&mut self, inherit_env: bool) {
+        writeln!(&mut self.text, "inherit env: {inherit_env}").unwrap();
     }
 
     fn write_env(&mut self, env: &[(String, String)]) {
