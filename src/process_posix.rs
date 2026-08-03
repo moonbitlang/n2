@@ -492,6 +492,9 @@ fn run_command_with_std_process(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()?;
+    // Command retains its configured stdio handles after spawning. Drop the
+    // parent-side pipe writers before waiting for EOF on the read end.
+    drop(command);
 
     let mut buf: [u8; 4 << 10] = [0; 4 << 10];
     loop {
