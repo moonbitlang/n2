@@ -175,21 +175,25 @@ struct Envp {
 }
 
 impl Envp {
-    fn new(env: &[(String, String)]) -> anyhow::Result<Option<Self>> {
-        if env.is_empty() {
+    fn new(env: &[(String, String)], inherit_env: bool) -> anyhow::Result<Option<Self>> {
+        if inherit_env && env.is_empty() {
             return Ok(None);
         }
 
         validate_env(env)?;
 
-        let mut vars: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
-            .map(|(key, value)| {
-                (
-                    key.as_os_str().as_bytes().to_vec(),
-                    value.as_os_str().as_bytes().to_vec(),
-                )
-            })
-            .collect();
+        let mut vars: Vec<(Vec<u8>, Vec<u8>)> = if inherit_env {
+            std::env::vars_os()
+                .map(|(key, value)| {
+                    (
+                        key.as_os_str().as_bytes().to_vec(),
+                        value.as_os_str().as_bytes().to_vec(),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         for (key, value) in env {
             let key = key.as_bytes();
@@ -254,20 +258,21 @@ pub fn run_command(
     cmdline: &str,
     cwd: Option<&Path>,
     env: &[(String, String)],
+    inherit_env: bool,
     mut output_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<Termination> {
     #[cfg(not(target_os = "macos"))]
     if let Some(cwd) = cwd {
         // Portable spawn chdir actions are not available on older libcs, so
         // let std handle the cwd-specific spawn path.
-        return run_command_with_std_process(cmdline, cwd, env, output_cb);
+        return run_command_with_std_process(cmdline, cwd, env, inherit_env, output_cb);
     }
 
     // Spawn the subprocess using posix_spawn with output redirected to the pipe.
     // We don't use Rust's process spawning because of issue #14 and because
     // we want to feed both stdout and stderr into the same pipe, which cannot
     // be done with the existing std::process API.
-    let envp = Envp::new(env)?;
+    let envp = Envp::new(env, inherit_env)?;
     let (pid, mut pipe) = unsafe {
         let pipe = pipe2()?;
 
@@ -381,7 +386,7 @@ mod tests {
             ),
         ] {
             let mut output = Vec::new();
-            let err = run_command("printf unexpected", cwd, &env, |buf| {
+            let err = run_command("printf unexpected", cwd, &env, true, |buf| {
                 output.extend_from_slice(buf)
             })
             .expect_err("expected invalid environment entry");
@@ -399,10 +404,26 @@ mod tests {
     fn command_env() -> anyhow::Result<()> {
         let mut output = Vec::new();
         let env = [("N2_PROCESS_TEST_ENV".to_owned(), "hello".to_owned())];
-        run_command("printf %s \"$N2_PROCESS_TEST_ENV\"", None, &env, |buf| {
-            output.extend_from_slice(buf)
-        })?;
+        run_command(
+            "printf %s \"$N2_PROCESS_TEST_ENV\"",
+            None,
+            &env,
+            true,
+            |buf| output.extend_from_slice(buf),
+        )?;
         assert_eq!(output, b"hello");
+        Ok(())
+    }
+
+    #[test]
+    fn command_env_can_disable_inheritance() -> anyhow::Result<()> {
+        let env = [("N2_PROCESS_TEST_EXPLICIT".to_owned(), "child".to_owned())];
+        let envp = Envp::new(&env, false)?.expect("isolated environment block");
+        assert_eq!(envp.storage.len(), 1);
+        assert_eq!(
+            envp.storage[0].to_bytes(),
+            b"N2_PROCESS_TEST_EXPLICIT=child"
+        );
         Ok(())
     }
 
@@ -421,6 +442,7 @@ mod tests {
             "printf %s \"$N2_PROCESS_TEST_ENV\"",
             Some(dir.path()),
             &env,
+            true,
             |buf| output.extend_from_slice(buf),
         )?;
         assert_eq!(output, b"hello");
@@ -441,6 +463,7 @@ fn run_command_with_std_process(
     cmdline: &str,
     cwd: &Path,
     env: &[(String, String)],
+    inherit_env: bool,
     mut output_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<Termination> {
     validate_env(env)?;
@@ -458,10 +481,12 @@ fn run_command_with_std_process(
     let stdout = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
     let stderr = unsafe { std::fs::File::from_raw_fd(stderr_fd) };
 
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(cmdline)
-        .current_dir(cwd)
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(cmdline).current_dir(cwd);
+    if !inherit_env {
+        command.env_clear();
+    }
+    let mut child = command
         .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))

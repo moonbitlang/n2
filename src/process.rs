@@ -10,6 +10,7 @@ pub fn run_command(
     _cmdline: &str,
     _cwd: Option<&std::path::Path>,
     _env: &[(String, String)],
+    _inherit_env: bool,
     _output_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<Termination> {
     anyhow::bail!("wasm cannot run commands");

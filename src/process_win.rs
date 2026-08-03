@@ -155,21 +155,26 @@ impl<'a> Drop for ProcThreadAttributeList<'a> {
     }
 }
 
-fn make_environment_block(env: &[(String, String)]) -> anyhow::Result<Option<Vec<u16>>> {
-    if env.is_empty() {
+fn make_environment_block(
+    env: &[(String, String)],
+    inherit_env: bool,
+) -> anyhow::Result<Option<Vec<u16>>> {
+    if inherit_env && env.is_empty() {
         return Ok(None);
     }
 
     let mut vars = std::collections::BTreeMap::<String, (Vec<u16>, Vec<u16>)>::new();
-    for (key, value) in std::env::vars_os() {
-        let normalized_key = key.to_string_lossy().to_uppercase();
-        vars.insert(
-            normalized_key,
-            (
-                key.as_os_str().encode_wide().collect(),
-                value.as_os_str().encode_wide().collect(),
-            ),
-        );
+    if inherit_env {
+        for (key, value) in std::env::vars_os() {
+            let normalized_key = key.to_string_lossy().to_uppercase();
+            vars.insert(
+                normalized_key,
+                (
+                    key.as_os_str().encode_wide().collect(),
+                    value.as_os_str().encode_wide().collect(),
+                ),
+            );
+        }
     }
 
     for (key, value) in env {
@@ -196,6 +201,9 @@ fn make_environment_block(env: &[(String, String)]) -> anyhow::Result<Option<Vec
         block.extend(value);
         block.push(0);
     }
+    if block.is_empty() {
+        block.push(0);
+    }
     block.push(0);
 
     Ok(Some(block))
@@ -205,6 +213,7 @@ pub fn run_command(
     cmdline: &str,
     cwd: Option<&Path>,
     env: &[(String, String)],
+    inherit_env: bool,
     mut output_cb: impl FnMut(&[u8]),
 ) -> anyhow::Result<Termination> {
     // Don't want to run `cmd /c` since that limits cmd line length to 8192 bytes.
@@ -235,7 +244,7 @@ pub fn run_command(
 
     let process_info = unsafe {
         // TODO: Set this to just 0 for console pool jobs.
-        let env_block = make_environment_block(env)?;
+        let env_block = make_environment_block(env, inherit_env)?;
         let process_flags = CREATE_NEW_PROCESS_GROUP
             | EXTENDED_STARTUPINFO_PRESENT
             | if env_block.is_some() {
@@ -352,7 +361,7 @@ mod tests {
     #[test]
     fn run_echo() -> anyhow::Result<()> {
         let mut output = Vec::new();
-        run_command("cmd /c echo hello", None, &[], |buf| {
+        run_command("cmd /c echo hello", None, &[], true, |buf| {
             output.extend_from_slice(buf)
         })?;
         assert_eq!(output, b"hello\r\n");
@@ -363,7 +372,7 @@ mod tests {
     #[test]
     fn empty_command() -> anyhow::Result<()> {
         let mut output = Vec::new();
-        let err = run_command("", None, &[], |buf| output.extend_from_slice(buf))
+        let err = run_command("", None, &[], true, |buf| output.extend_from_slice(buf))
             .expect_err("expected failure");
         assert!(err.to_string().contains("command is empty"));
         Ok(())
@@ -373,7 +382,7 @@ mod tests {
     #[test]
     fn initial_space() -> anyhow::Result<()> {
         let mut output = Vec::new();
-        let err = run_command(" cmd /c echo hello", None, &[], |buf| {
+        let err = run_command(" cmd /c echo hello", None, &[], true, |buf| {
             output.extend_from_slice(buf)
         })
         .expect_err("expected failure");
@@ -386,7 +395,7 @@ mod tests {
     #[test]
     fn missing_command() {
         let mut output = Vec::new();
-        let err = run_command("command_not_exits", None, &[], |buf| {
+        let err = run_command("command_not_exits", None, &[], true, |buf| {
             output.extend_from_slice(buf)
         })
         .expect_err("expected failure");
@@ -397,10 +406,30 @@ mod tests {
     fn command_env() -> anyhow::Result<()> {
         let mut output = Vec::new();
         let env = [("N2_PROCESS_TEST_ENV".to_owned(), "hello".to_owned())];
-        run_command("cmd /c echo %N2_PROCESS_TEST_ENV%", None, &env, |buf| {
-            output.extend_from_slice(buf)
-        })?;
+        run_command(
+            "cmd /c echo %N2_PROCESS_TEST_ENV%",
+            None,
+            &env,
+            true,
+            |buf| output.extend_from_slice(buf),
+        )?;
         assert_eq!(output, b"hello\r\n");
+        Ok(())
+    }
+
+    #[test]
+    fn command_env_can_disable_inheritance() -> anyhow::Result<()> {
+        let env = [("N2_PROCESS_TEST_EXPLICIT".to_owned(), "child".to_owned())];
+        let expected: Vec<u16> = "N2_PROCESS_TEST_EXPLICIT=child\0\0"
+            .encode_utf16()
+            .collect();
+        assert_eq!(make_environment_block(&env, false)?, Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_isolated_environment_block_is_double_nul_terminated() -> anyhow::Result<()> {
+        assert_eq!(make_environment_block(&[], false)?, Some(vec![0, 0]));
         Ok(())
     }
 }

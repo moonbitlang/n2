@@ -161,6 +161,9 @@ pub struct Build {
     /// Working directory for running the command, if specified.
     pub cwd: Option<String>,
 
+    /// Whether to inherit the n2 process environment when running the command.
+    pub inherit_env: bool,
+
     /// Environment variables to add or override when running the command.
     pub env: Vec<(String, String)>,
 
@@ -193,6 +196,7 @@ impl Build {
             desc: None,
             cmdline: None,
             cwd: None,
+            inherit_env: true,
             env: Vec::new(),
             depfile: None,
             parse_showincludes: false,

@@ -150,6 +150,7 @@ fn run_task(
     cmdline: &str,
     cwd: Option<&Path>,
     env: &[(String, String)],
+    inherit_env: bool,
     depfile: Option<&Path>,
     parse_showincludes: bool,
     rspfile: Option<&RspFile>,
@@ -165,7 +166,7 @@ fn run_task(
     let termination = {
         let exec_span = tracing::info_span!("task.exec");
         let _exec_enter = exec_span.enter();
-        process::run_command(cmdline, cwd, env, |buf| {
+        process::run_command(cmdline, cwd, env, inherit_env, |buf| {
             output.extend_from_slice(buf);
             last_line_cb(find_last_line(&output));
         })?
@@ -328,6 +329,7 @@ impl Runner {
         let cmdline = build.cmdline.clone().unwrap();
         let cwd = build.cwd.clone().map(PathBuf::from);
         let env = build.env.clone();
+        let inherit_env = build.inherit_env;
         let depfile = build.depfile.clone().map(PathBuf::from);
         let rspfile = build.rspfile.clone();
         let parse_showincludes = build.parse_showincludes;
@@ -349,6 +351,7 @@ impl Runner {
                     &cmdline,
                     cwd.as_deref(),
                     &env,
+                    inherit_env,
                     depfile.as_deref(),
                     parse_showincludes,
                     rspfile.as_ref(),
