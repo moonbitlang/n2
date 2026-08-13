@@ -6,7 +6,7 @@ use crate::{
     hash::BuildHash,
 };
 use anyhow::bail;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Read;
@@ -15,6 +15,7 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 const VERSION: u32 = 1;
 const SIGNATURE: &[u8; 4] = b"n2db";
@@ -23,17 +24,14 @@ const SIGNATURE: &[u8; 4] = b"n2db";
 const MIN_COMPACTION_SIZE: u64 = 2 * 1024 * 1024;
 const COMPACTION_RATIO: u64 = 3;
 
-// These sizes mirror the wire format written below. A database starts with a
-// 4-byte signature and u32 version. A path record has a u16 length; a build
-// record has u16 output/dependency counts and a u64 hash. All path references
-// are packed into three bytes.
+// A database starts with a 4-byte signature and u32 version. All path
+// references are packed into three bytes.
 const DATABASE_HEADER_SIZE: u64 = 8;
-const PATH_RECORD_HEADER_SIZE: u64 = 2;
 const BUILD_RECORD_FIXED_SIZE: u64 = 12;
 const PATH_ID_SIZE: usize = 3;
 
 /// Files are identified by integers that are stable across n2 executions.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id(u32);
 impl densemap::Index for Id {
     fn index(&self) -> usize {
@@ -179,9 +177,36 @@ impl Writer {
 
     fn rewrite_compacted(
         mut file: File,
+        ids: IdMap,
         graph: &Graph,
         plan: &CompactionPlan,
     ) -> std::io::Result<Self> {
+        if plan.encoded_size > usize::MAX as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "compacted database does not fit in memory",
+            ));
+        }
+
+        // Preserve database path IDs, then copy the latest raw build records
+        // in their original order. Read everything before truncating so an I/O
+        // error leaves the old database untouched.
+        let mut compacted = Vec::with_capacity(plan.encoded_size as usize);
+        compacted.extend_from_slice(SIGNATURE);
+        compacted.extend_from_slice(&VERSION.to_le_bytes());
+        for &fileid in ids.fileids.iter() {
+            let name = &graph.file(fileid).name;
+            compacted.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            compacted.extend_from_slice(name.as_bytes());
+        }
+        for range in &plan.build_ranges {
+            file.seek(SeekFrom::Start(range.start))?;
+            let start = compacted.len();
+            compacted.resize(start + range.len() as usize, 0);
+            file.read_exact(&mut compacted[start..])?;
+        }
+        debug_assert_eq!(compacted.len() as u64, plan.encoded_size);
+
         // Make the empty valid log durable before writing records. If the
         // process stops during the rewrite, the next open can discard the
         // incomplete final record and keep the preceding complete prefix.
@@ -189,11 +214,10 @@ impl Writer {
         file.sync_all()?;
         file.seek(SeekFrom::Start(DATABASE_HEADER_SIZE))?;
 
-        let mut writer = Self::from_opened(IdMap::default(), file);
-        let result = plan
-            .builds
-            .iter()
-            .try_for_each(|&(id, hash)| writer.write_build(graph, id, hash))
+        let mut writer = Self::from_opened(ids, file);
+        let result = writer
+            .w
+            .write_all(&compacted[DATABASE_HEADER_SIZE as usize..])
             .and_then(|()| writer.w.sync_all());
         if let Err(err) = result {
             if let Err(cleanup_err) = writer
@@ -212,44 +236,123 @@ impl Writer {
     }
 }
 
-struct CompactionPlan {
-    builds: Vec<(BuildId, BuildHash)>,
-    encoded_size: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordRange {
+    start: u64,
+    end: u64,
 }
 
-impl CompactionPlan {
-    /// Capture the exact persistent state and encoded size to rewrite.
-    ///
-    /// GraphFiles also contains paths read from obsolete database records, so
-    /// paths are reachable from live builds rather than every graph file. A
-    /// stored hash, including BuildHash(0), is what makes a current build live.
-    fn new(graph: &Graph, hashes: &Hashes) -> Self {
-        let mut builds = Vec::new();
-        let mut paths: HashSet<FileId> = HashSet::new();
-        let mut encoded_size = DATABASE_HEADER_SIZE;
+impl RecordRange {
+    fn len(self) -> u64 {
+        self.end - self.start
+    }
+}
 
-        for (index, build) in graph.builds.iter().enumerate() {
-            let id = BuildId::from(index);
-            let Some(hash) = hashes.get(id) else {
-                continue;
-            };
+struct LiveRecord {
+    outs: Rc<[Id]>,
+    range: RecordRange,
+}
 
-            builds.push((id, hash));
-            encoded_size += BUILD_RECORD_FIXED_SIZE
-                + PATH_ID_SIZE as u64 * (build.outs().len() + build.discovered_ins().len()) as u64;
-            paths.extend(build.outs().iter().copied());
-            paths.extend(build.discovered_ins().iter().copied());
-        }
+/// Tracks the latest persistent records independently of the current graph.
+///
+/// During replay, `slot_by_outputs` maps each exact database output list to its
+/// live slot in `records`. Seeing the same outputs again turns the old slot into
+/// a tombstone and appends the new record range, so flattening `records` yields
+/// the retained records in last-occurrence order without sorting. When
+/// tombstones outnumber live records, a stable retain and reindex bounds memory;
+/// its cost is amortized over the overwritten records that created them.
+///
+/// The tracker also maintains a monotonic lower bound for the compacted size:
+/// all path bytes plus the smallest possible record for each distinct output
+/// list. Once that exceeds the compaction ratio, tracking stops because no
+/// future replacement can make compaction eligible again.
+///
+/// Compaction keeps the path table in database-ID order and copies these raw
+/// build ranges. Graph membership therefore affects replay projection only,
+/// never which persistent records survive.
+struct CompactionTracker {
+    /// Exact output lists locate their current slots; ordering comes only from
+    /// the append-ordered slots, never from HashMap iteration.
+    slot_by_outputs: HashMap<Rc<[Id]>, usize>,
+    records: Vec<Option<LiveRecord>>,
+    // Keep every path record so raw build record IDs remain valid after rewrite.
+    path_bytes: u64,
+    build_bytes: u64,
+    minimum_build_bytes: u64,
+    maximum_encoded_size: u64,
+}
 
-        for id in paths {
-            encoded_size += PATH_RECORD_HEADER_SIZE + graph.file(id).name.len() as u64;
-        }
-
+impl CompactionTracker {
+    fn new(database_size: u64) -> Self {
         Self {
-            builds,
-            encoded_size,
+            slot_by_outputs: HashMap::new(),
+            records: Vec::new(),
+            path_bytes: 0,
+            build_bytes: 0,
+            minimum_build_bytes: 0,
+            maximum_encoded_size: database_size / COMPACTION_RATIO,
         }
     }
+
+    /// Returns whether compaction can still meet the configured ratio.
+    fn record_path(&mut self, range: RecordRange) -> bool {
+        self.path_bytes += range.len();
+        self.minimum_encoded_size() <= self.maximum_encoded_size
+    }
+
+    /// Returns whether compaction can still meet the configured ratio.
+    fn record_build(&mut self, outs: Vec<Id>, range: RecordRange) -> bool {
+        let outs: Rc<[Id]> = outs.into();
+        let index = self.records.len();
+        if let Some(old_index) = self.slot_by_outputs.insert(outs.clone(), index) {
+            let old = self.records[old_index]
+                .take()
+                .expect("latest output list must point to a live record");
+            self.build_bytes -= old.range.len();
+        } else {
+            self.minimum_build_bytes +=
+                BUILD_RECORD_FIXED_SIZE + PATH_ID_SIZE as u64 * outs.len() as u64;
+        }
+
+        self.build_bytes += range.len();
+        self.records.push(Some(LiveRecord { outs, range }));
+
+        // Stable packing bounds tombstones to the number of live records. Its
+        // cost is amortized over the overwritten records that created them.
+        if self.records.len() > self.slot_by_outputs.len().saturating_mul(2) {
+            self.records.retain(Option::is_some);
+            for (index, record) in self.records.iter().enumerate() {
+                let record = record.as_ref().unwrap();
+                *self
+                    .slot_by_outputs
+                    .get_mut(record.outs.as_ref())
+                    .expect("live record must have an output-list index") = index;
+            }
+        }
+
+        self.minimum_encoded_size() <= self.maximum_encoded_size
+    }
+
+    fn minimum_encoded_size(&self) -> u64 {
+        DATABASE_HEADER_SIZE + self.path_bytes + self.minimum_build_bytes
+    }
+
+    fn into_plan(self) -> CompactionPlan {
+        CompactionPlan {
+            build_ranges: self
+                .records
+                .into_iter()
+                .flatten()
+                .map(|record| record.range)
+                .collect(),
+            encoded_size: DATABASE_HEADER_SIZE + self.path_bytes + self.build_bytes,
+        }
+    }
+}
+
+struct CompactionPlan {
+    build_ranges: Vec<RecordRange>,
+    encoded_size: u64,
 }
 
 fn should_compact(old_size: u64, compacted_size: u64) -> bool {
@@ -260,8 +363,8 @@ fn compact_if_needed(
     path: &Path,
     mut file: File,
     old_ids: IdMap,
+    tracker: Option<CompactionTracker>,
     graph: &Graph,
-    hashes: &Hashes,
     valid_size: u64,
 ) -> std::io::Result<Writer> {
     let old_size = file.seek(SeekFrom::End(0))?;
@@ -278,7 +381,15 @@ fn compact_if_needed(
     if valid_size < MIN_COMPACTION_SIZE {
         return Ok(Writer::from_opened(old_ids, file));
     }
-    let plan = CompactionPlan::new(graph, hashes);
+    let Some(tracker) = tracker else {
+        tracing::debug!(
+            path = %path.display(),
+            old_size = valid_size,
+            "skipped database compaction after its minimum size exceeded the ratio"
+        );
+        return Ok(Writer::from_opened(old_ids, file));
+    };
+    let plan = tracker.into_plan();
     tracing::debug!(
         path = %path.display(),
         old_size = valid_size,
@@ -289,7 +400,7 @@ fn compact_if_needed(
         return Ok(Writer::from_opened(old_ids, file));
     }
 
-    let writer = Writer::rewrite_compacted(file, graph, &plan)?;
+    let writer = Writer::rewrite_compacted(file, old_ids, graph, &plan)?;
     tracing::info!(
         path = %path.display(),
         old_size = valid_size,
@@ -302,6 +413,7 @@ fn compact_if_needed(
 struct Reader<'a> {
     r: BufReader<&'a mut File>,
     ids: IdMap,
+    tracker: Option<CompactionTracker>,
     graph: &'a mut Graph,
     hashes: &'a mut Hashes,
 }
@@ -335,16 +447,27 @@ impl<'a> Reader<'a> {
         Ok(unsafe { String::from_utf8_unchecked(buf) })
     }
 
-    fn read_path(&mut self, len: usize) -> std::io::Result<()> {
+    fn read_path(&mut self, len: usize, record_start: u64) -> std::io::Result<()> {
         let name = self.read_str(len)?;
         // No canonicalization needed, paths were written canonicalized.
         let fileid = self.graph.files.id_from_canonical(name);
         let dbid = self.ids.fileids.push(fileid);
         self.ids.db_ids.insert(fileid, dbid);
+        if self.tracker.is_some() {
+            let record_end = self.r.stream_position()?;
+            let tracker = self.tracker.as_mut().unwrap();
+            let still_candidate = tracker.record_path(RecordRange {
+                start: record_start,
+                end: record_end,
+            });
+            if !still_candidate {
+                self.tracker = None;
+            }
+        }
         Ok(())
     }
 
-    fn read_build(&mut self, len: usize) -> std::io::Result<()> {
+    fn read_build(&mut self, len: usize, record_start: u64) -> std::io::Result<()> {
         // This record logs a build.  We expect all the outputs to be
         // outputs of the same build id; if not, that means the graph has
         // changed since this log, in which case we just ignore it.
@@ -356,32 +479,30 @@ impl<'a> Reader<'a> {
         // to rebuild A regardless, and these dependencies are only used
         // to affect dirty checking, not build order.
 
+        let mut outs = self.tracker.as_ref().map(|_| Vec::with_capacity(len));
         let mut unique_bid = None;
         let mut obsolete = false;
         for _ in 0..len {
-            let fileid = self.read_id()?;
+            let id = self.read_id()?;
+            let fileid = self.ids.fileids[id];
+            if let Some(outs) = &mut outs {
+                outs.push(id);
+            }
             if obsolete {
-                // Even though we know we don't want this record, we must
-                // keep reading to parse through it.
+                // Even though we know this record does not match the current
+                // graph, retain its outputs for graph-independent compaction.
                 continue;
             }
-            match self.graph.file(self.ids.fileids[fileid]).input {
-                None => {
-                    obsolete = true;
-                }
-                Some(bid) => {
-                    match unique_bid {
-                        None => unique_bid = Some(bid),
-                        Some(unique_bid) if unique_bid == bid => {
-                            // Ok, matches the existing id.
-                        }
-                        Some(_) => {
-                            // Mismatch.
-                            unique_bid = None;
-                            obsolete = true;
-                        }
+            match self.graph.file(fileid).input {
+                None => obsolete = true,
+                Some(bid) => match unique_bid {
+                    None => unique_bid = Some(bid),
+                    Some(unique_bid) if unique_bid == bid => {}
+                    Some(_) => {
+                        unique_bid = None;
+                        obsolete = true;
                     }
-                }
+                },
             }
         }
 
@@ -394,11 +515,24 @@ impl<'a> Reader<'a> {
 
         let hash = BuildHash(self.read_u64()?);
 
-        // unique_bid is set here if this record is valid.
         if let Some(id) = unique_bid {
             // Common case: only one associated build.
             self.graph.builds[id].set_discovered_ins(deps);
             self.hashes.set(id, hash);
+        }
+        if let Some(outs) = outs {
+            let record_end = self.r.stream_position()?;
+            let tracker = self.tracker.as_mut().unwrap();
+            let still_candidate = tracker.record_build(
+                outs,
+                RecordRange {
+                    start: record_start,
+                    end: record_end,
+                },
+            );
+            if !still_candidate {
+                self.tracker = None;
+            }
         }
         Ok(())
     }
@@ -435,13 +569,13 @@ impl<'a> Reader<'a> {
             let result = if len & mask == 0 {
                 let _path_span =
                     tracing::info_span!("db.read_path_record", name_len = (len as usize)).entered();
-                self.read_path(len as usize)
+                self.read_path(len as usize, record_start)
             } else {
                 let outs_len = (len & !mask) as usize;
                 let _build_span =
                     tracing::info_span!("db.read_build_record", outs_len = outs_len).entered();
                 len &= !mask;
-                self.read_build(len as usize)
+                self.read_build(len as usize, record_start)
             };
             match result {
                 Ok(()) => {}
@@ -454,16 +588,23 @@ impl<'a> Reader<'a> {
     }
 
     /// Reads an on-disk database, loading its state into the provided Graph/Hashes.
-    fn read(f: &mut File, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Result<(IdMap, u64)> {
+    fn read(
+        f: &mut File,
+        graph: &mut Graph,
+        hashes: &mut Hashes,
+        database_size: u64,
+    ) -> anyhow::Result<(IdMap, Option<CompactionTracker>, u64)> {
         let mut r = Reader {
             r: std::io::BufReader::new(f),
             ids: IdMap::default(),
+            tracker: (database_size >= MIN_COMPACTION_SIZE)
+                .then(|| CompactionTracker::new(database_size)),
             graph,
             hashes,
         };
         let valid_size = r.read_file()?;
 
-        Ok((r.ids, valid_size))
+        Ok((r.ids, r.tracker, valid_size))
     }
 }
 
@@ -515,7 +656,9 @@ impl std::error::Error for OpenErrorKind {
 /// Opens or creates an on-disk database, loading its state into the provided Graph.
 ///
 /// Existing databases are automatically compacted after replay when they are
-/// at least 2 MiB and at least three times the encoded size of their live state.
+/// at least 2 MiB and at least three times the encoded size of their path table
+/// and the latest build record for each exact output list. Records outside the
+/// current graph are preserved.
 /// Incomplete trailing records are discarded on open, and compaction rewrites
 /// the existing file in place so its identity and metadata are preserved. The
 /// caller must provide exclusive access to `path` for the lifetime of the
@@ -532,15 +675,22 @@ pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Write
         Ok(mut f) => {
             let _branch = tracing::info_span!("db.open_existing").entered();
             tracing::info!(path = %path.display(), "opening existing database");
-            let (ids, valid_size) = {
+            let database_size = f
+                .metadata()
+                .map_err(|err| OpenError {
+                    path: path.to_path_buf(),
+                    source: OpenErrorKind::OpenDB(err),
+                })?
+                .len();
+            let (ids, tracker, valid_size) = {
                 let _read = tracing::info_span!("db.read").entered();
-                Reader::read(&mut f, graph, hashes).map_err(|err| OpenError {
+                Reader::read(&mut f, graph, hashes, database_size).map_err(|err| OpenError {
                     path: path.to_path_buf(),
                     source: OpenErrorKind::ReadDB(err),
                 })?
             };
             tracing::info!(path = %path.display(), "database loaded successfully");
-            compact_if_needed(path, f, ids, graph, hashes, valid_size).map_err(|err| OpenError {
+            compact_if_needed(path, f, ids, tracker, graph, valid_size).map_err(|err| OpenError {
                 path: path.to_path_buf(),
                 source: OpenErrorKind::OpenDB(err),
             })
@@ -565,16 +715,14 @@ pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Write
 mod tests {
     use super::*;
 
+    const OUT_ONLY_MANIFEST: &[u8] = b"build out: phony\n";
+    const OUT_AND_OTHER_MANIFEST: &[u8] = b"build out: phony\nbuild other-out: phony\n";
+
     fn graph_with_discovered_deps(
+        manifest: &[u8],
         dep_count: usize,
-        include_dead_build: bool,
     ) -> anyhow::Result<(Graph, BuildId)> {
-        let manifest = if include_dead_build {
-            b"build out: phony\nbuild dead-out: phony\n".to_vec()
-        } else {
-            b"build out: phony\n".to_vec()
-        };
-        let mut graph = crate::load::parse("build.ninja", manifest)?;
+        let mut graph = crate::load::parse("build.ninja", manifest.to_vec())?;
         let id = graph
             .file(graph.files.lookup("out").unwrap())
             .input
@@ -586,21 +734,25 @@ mod tests {
         Ok((graph, id))
     }
 
-    fn open_current(path: &Path) -> anyhow::Result<(Graph, BuildId, Hashes, Writer)> {
-        let (mut graph, id) = graph_with_discovered_deps(0, false)?;
+    fn open_out_only(path: &Path) -> anyhow::Result<(Graph, BuildId, Hashes, Writer)> {
+        let (mut graph, id) = graph_with_discovered_deps(OUT_ONLY_MANIFEST, 0)?;
         let mut hashes = Hashes::default();
         let writer = open(path, &mut graph, &mut hashes)?;
         Ok((graph, id, hashes, writer))
     }
 
     fn write_oversized_database(path: &Path) -> anyhow::Result<u64> {
-        let (mut graph, id) = graph_with_discovered_deps(16, true)?;
-        let dead_id = graph
-            .file(graph.files.lookup("dead-out").unwrap())
+        let (mut graph, id) = graph_with_discovered_deps(OUT_AND_OTHER_MANIFEST, 16)?;
+        let other_id = graph
+            .file(graph.files.lookup("other-out").unwrap())
             .input
             .unwrap();
+        let other_dep = graph.files.id_from_canonical("other-dep".to_owned());
+        graph.builds[other_id].set_discovered_ins(vec![other_dep]);
         let mut writer = open(path, &mut graph, &mut Hashes::default())?;
-        writer.write_build(&graph, dead_id, BuildHash(123))?;
+        // This record is written only once. It is absent from the partial graph
+        // that triggers compaction, but it has never been superseded.
+        writer.write_build(&graph, other_id, BuildHash(123))?;
         for hash in 1..=40_000 {
             writer.write_build(&graph, id, BuildHash(hash))?;
         }
@@ -610,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn open_compacts_obsolete_build_records() -> anyhow::Result<()> {
+    fn open_compaction_preserves_records_outside_current_graph() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join(".n2_db");
         let old_size = write_oversized_database(&path)?;
@@ -625,7 +777,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
 
-        let (graph, id, hashes, mut writer) = open_current(&path)?;
+        let (graph, id, hashes, mut writer) = open_out_only(&path)?;
 
         let new_size = std::fs::metadata(&path)?.len();
         assert!(new_size < old_size / 3);
@@ -646,17 +798,117 @@ mod tests {
         writer.write_build(&graph, id, appended_hash)?;
         drop(writer);
 
-        let (mut graph, id) = graph_with_discovered_deps(0, true)?;
-        let dead_id = graph
-            .file(graph.files.lookup("dead-out").unwrap())
+        let (mut graph, id) = graph_with_discovered_deps(OUT_AND_OTHER_MANIFEST, 0)?;
+        let other_id = graph
+            .file(graph.files.lookup("other-out").unwrap())
             .input
             .unwrap();
         let mut hashes = Hashes::default();
         let writer = open(&path, &mut graph, &mut hashes)?;
 
         assert_eq!(hashes.get(id), Some(appended_hash));
-        assert_eq!(hashes.get(dead_id), None);
+        assert_eq!(hashes.get(other_id), Some(BuildHash(123)));
         assert_eq!(graph.builds[id].discovered_ins().len(), 16);
+        let other_deps = graph.builds[other_id].discovered_ins();
+        assert_eq!(other_deps.len(), 1);
+        assert_eq!(graph.file(other_deps[0]).name, "other-dep");
+        drop(writer);
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_plan_preserves_latest_record_order() {
+        let a = Id(1);
+        let b = Id(2);
+        let mut tracker = CompactionTracker::new(u64::MAX);
+        tracker.record_build(vec![a], RecordRange { start: 10, end: 15 });
+        tracker.record_build(vec![b], RecordRange { start: 15, end: 20 });
+        tracker.record_build(vec![a], RecordRange { start: 20, end: 25 });
+        tracker.record_build(vec![a], RecordRange { start: 25, end: 30 });
+        // This record crosses the packing threshold. Stable packing must leave
+        // B followed by the last A rather than HashMap iteration order.
+        tracker.record_build(vec![a], RecordRange { start: 30, end: 35 });
+
+        let plan = tracker.into_plan();
+        assert_eq!(
+            plan.build_ranges,
+            vec![
+                RecordRange { start: 15, end: 20 },
+                RecordRange { start: 30, end: 35 }
+            ]
+        );
+        assert_eq!(plan.encoded_size, DATABASE_HEADER_SIZE + 10);
+    }
+
+    #[test]
+    fn compaction_tracker_stops_when_minimum_cannot_meet_ratio() {
+        let one_build_size = DATABASE_HEADER_SIZE + BUILD_RECORD_FIXED_SIZE + PATH_ID_SIZE as u64;
+        let mut tracker = CompactionTracker::new(one_build_size * COMPACTION_RATIO);
+
+        assert!(tracker.record_build(vec![Id(1)], RecordRange { start: 10, end: 20 }));
+        // Replacing the same output list can still shrink the exact compacted
+        // size, so it does not increase the lower bound.
+        assert!(tracker.record_build(vec![Id(1)], RecordRange { start: 20, end: 30 }));
+        // A distinct output list must survive forever and makes the theoretical
+        // minimum larger than one third of the database.
+        assert!(!tracker.record_build(vec![Id(2)], RecordRange { start: 30, end: 40 }));
+    }
+
+    #[test]
+    fn replay_accepts_removed_trailing_output() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(".n2_db");
+        let mut graph = crate::load::parse("build.ninja", b"build a b: phony\n".to_vec())?;
+        let id = graph.file(graph.files.lookup("a").unwrap()).input.unwrap();
+        let mut writer = open(&path, &mut graph, &mut Hashes::default())?;
+        writer.write_build(&graph, id, BuildHash(7))?;
+        drop(writer);
+
+        let mut graph = crate::load::parse("build.ninja", b"build a: phony\n".to_vec())?;
+        let id = graph.file(graph.files.lookup("a").unwrap()).input.unwrap();
+        let mut hashes = Hashes::default();
+        let writer = open(&path, &mut graph, &mut hashes)?;
+
+        assert_eq!(hashes.get(id), Some(BuildHash(7)));
+        drop(writer);
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_preserves_order_of_overlapping_output_lists() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(".n2_db");
+
+        let mut graph = crate::load::parse("build.ninja", b"build a b: phony\n".to_vec())?;
+        let id = graph.file(graph.files.lookup("a").unwrap()).input.unwrap();
+        let mut writer = open(&path, &mut graph, &mut Hashes::default())?;
+        writer.write_build(&graph, id, BuildHash(1))?;
+        drop(writer);
+
+        let mut graph = crate::load::parse("build.ninja", b"build a: phony\n".to_vec())?;
+        let id = graph.file(graph.files.lookup("a").unwrap()).input.unwrap();
+        let deps = (0..16)
+            .map(|i| graph.files.id_from_canonical(format!("dep-{i}")))
+            .collect();
+        let mut writer = open(&path, &mut graph, &mut Hashes::default())?;
+        graph.builds[id].set_discovered_ins(deps);
+        for hash in 2..=40_001 {
+            writer.write_build(&graph, id, BuildHash(hash))?;
+        }
+        drop(writer);
+        assert!(std::fs::metadata(&path)?.len() >= MIN_COMPACTION_SIZE);
+
+        let mut hashes = Hashes::default();
+        let writer = open(&path, &mut graph, &mut hashes)?;
+        assert_eq!(hashes.get(id), Some(BuildHash(40_001)));
+        drop(writer);
+
+        // Both [a, b] and [a] match this graph under the existing replay
+        // compatibility rule. Reopening after compaction verifies that the
+        // later [a] record remains authoritative.
+        let mut hashes = Hashes::default();
+        let writer = open(&path, &mut graph, &mut hashes)?;
+        assert_eq!(hashes.get(id), Some(BuildHash(40_001)));
         drop(writer);
         Ok(())
     }
@@ -685,7 +937,7 @@ mod tests {
         for tail_len in [1, record.0.len() - 1] {
             let dir = tempfile::tempdir()?;
             let path = dir.path().join(".n2_db");
-            let (graph, id, _, mut writer) = open_current(&path)?;
+            let (graph, id, _, mut writer) = open_out_only(&path)?;
             writer.write_build(&graph, id, BuildHash(7))?;
             drop(writer);
             let valid_size = std::fs::metadata(&path)?.len();
@@ -694,13 +946,13 @@ mod tests {
             file.write_all(&record.0[..tail_len])?;
             drop(file);
 
-            let (graph, id, hashes, mut writer) = open_current(&path)?;
+            let (graph, id, hashes, mut writer) = open_out_only(&path)?;
             assert_eq!(hashes.get(id), Some(BuildHash(7)));
             assert_eq!(std::fs::metadata(&path)?.len(), valid_size);
 
             writer.write_build(&graph, id, BuildHash(42))?;
             drop(writer);
-            let (_, id, hashes, writer) = open_current(&path)?;
+            let (_, id, hashes, writer) = open_out_only(&path)?;
             assert_eq!(hashes.get(id), Some(BuildHash(42)));
             drop(writer);
         }
