@@ -404,3 +404,62 @@ pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Write
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OUT_ONLY: &[u8] = b"build out: phony\n";
+    const OUT_AND_OTHER: &[u8] = b"build out: phony\nbuild other-out: phony\n";
+
+    fn build_graph(manifest: &[u8], dep_count: usize) -> anyhow::Result<(Graph, BuildId)> {
+        let mut graph = crate::load::parse("build.ninja", manifest.to_vec())?;
+        let id = graph
+            .file(graph.files.lookup("out").unwrap())
+            .input
+            .unwrap();
+        let deps = (0..dep_count)
+            .map(|i| graph.files.id_from_canonical(format!("dep-{i}")))
+            .collect();
+        graph.builds[id].set_discovered_ins(deps);
+        Ok((graph, id))
+    }
+
+    #[test]
+    fn opening_with_a_partial_graph_preserves_other_records() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(".n2_db");
+        let (mut graph, id) = build_graph(OUT_AND_OTHER, 16)?;
+        let other_id = graph
+            .file(graph.files.lookup("other-out").unwrap())
+            .input
+            .unwrap();
+        let mut writer = open(&path, &mut graph, &mut Hashes::default())?;
+        writer.write_build(&graph, other_id, BuildHash(123))?;
+        for hash in 1..=40_000 {
+            writer.write_build(&graph, id, BuildHash(hash))?;
+        }
+        drop(writer);
+        // Keep the fixture above the threshold used by the reverted automatic
+        // compaction so reintroducing it unsafely makes this test fail.
+        assert!(std::fs::metadata(&path)?.len() >= 2 * 1024 * 1024);
+
+        // Opening a shared database with one invocation's partial graph must
+        // not erase records owned by another invocation.
+        let (mut partial_graph, _) = build_graph(OUT_ONLY, 0)?;
+        let writer = open(&path, &mut partial_graph, &mut Hashes::default())?;
+        drop(writer);
+
+        let (mut graph, _) = build_graph(OUT_AND_OTHER, 0)?;
+        let other_id = graph
+            .file(graph.files.lookup("other-out").unwrap())
+            .input
+            .unwrap();
+        let mut hashes = Hashes::default();
+        let writer = open(&path, &mut graph, &mut hashes)?;
+
+        assert_eq!(hashes.get(other_id), Some(BuildHash(123)));
+        drop(writer);
+        Ok(())
+    }
+}
