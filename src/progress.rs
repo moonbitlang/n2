@@ -28,6 +28,9 @@ pub fn build_message(build: &Build, with_detail: bool) -> &str {
     }
 }
 
+/// Receives the complete output of one finished build task.
+pub type BuildOutputCallback = dyn Fn(BuildId, &str) + Send;
+
 /// Trait for build progress notifications.
 pub trait Progress {
     /// Called as individual build tasks progress through build states.
@@ -71,11 +74,21 @@ pub struct DumbConsoleProgress {
     /// The id of the last command printed, used to avoid printing it twice
     /// when we have two updates from the same command in a row.
     last_started: Option<BuildId>,
-    callback: Option<Box<dyn Fn(&str) + Send>>,
+    callback: Option<Box<BuildOutputCallback>>,
 }
 
 impl DumbConsoleProgress {
     pub fn new(verbose: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
+        let callback = callback.map(|callback| {
+            Box::new(move |_, output: &str| callback(output)) as Box<BuildOutputCallback>
+        });
+        Self::new_with_build_output(verbose, callback)
+    }
+
+    pub fn new_with_build_output(
+        verbose: bool,
+        callback: Option<Box<BuildOutputCallback>>,
+    ) -> Self {
         Self {
             verbose,
             last_started: None,
@@ -102,7 +115,7 @@ impl Progress for DumbConsoleProgress {
         // ignore
     }
 
-    fn task_finished(&mut self, _id: BuildId, build: &Build, result: &TaskResult) {
+    fn task_finished(&mut self, id: BuildId, build: &Build, result: &TaskResult) {
         match result.termination {
             Termination::Success => {
                 // Common case: don't show anything.
@@ -122,7 +135,7 @@ impl Progress for DumbConsoleProgress {
         if !result.output.is_empty() {
             if let Some(ref callback) = self.callback {
                 let msg = String::from_utf8_lossy(&result.output).to_string();
-                callback(&msg);
+                callback(id, &msg);
             } else {
                 std::io::stdout().write_all(&result.output).unwrap();
             }
@@ -157,6 +170,16 @@ const UPDATE_DELAY: Duration = std::time::Duration::from_millis(50);
 
 impl FancyConsoleProgress {
     pub fn new(verbose: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
+        let callback = callback.map(|callback| {
+            Box::new(move |_, output: &str| callback(output)) as Box<BuildOutputCallback>
+        });
+        Self::new_with_build_output(verbose, callback)
+    }
+
+    pub fn new_with_build_output(
+        verbose: bool,
+        callback: Option<Box<BuildOutputCallback>>,
+    ) -> Self {
         let dirty_cond = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(FancyState {
             done: false,
@@ -262,7 +285,7 @@ struct FancyState {
     tasks: VecDeque<Task>,
     /// Whether to print command lines of started programs.
     verbose: bool,
-    callback: Option<Box<dyn Fn(&str) + Send>>,
+    callback: Option<Box<BuildOutputCallback>>,
 }
 
 impl FancyState {
@@ -326,7 +349,7 @@ impl FancyState {
             if let Some(ref callback) = self.callback {
                 self.clear_progress();
                 let msg = String::from_utf8_lossy(&result.output).to_string();
-                callback(&msg);
+                callback(id, &msg);
             } else {
                 std::io::stdout().write_all(&result.output).unwrap();
             }
@@ -476,7 +499,53 @@ fn progress_bar(counts: &StateCounts, bar_size: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, rc::Rc};
+
+    use crate::graph::{BuildIns, BuildOuts, FileLoc};
+
     use super::*;
+
+    #[test]
+    fn completed_output_retains_build_id() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&captured);
+        let mut progress = DumbConsoleProgress::new_with_build_output(
+            false,
+            Some(Box::new(move |id, content| {
+                output.lock().unwrap().push((id, content.to_owned()));
+            })),
+        );
+        let mut build = Build::new(
+            FileLoc {
+                filename: Rc::new(PathBuf::from("build.ninja")),
+                line: 1,
+            },
+            BuildIns {
+                ids: Vec::new(),
+                explicit: 0,
+                implicit: 0,
+                order_only: 0,
+            },
+            BuildOuts {
+                ids: Vec::new(),
+                explicit: 0,
+            },
+        );
+        build.cmdline = Some("command".to_owned());
+        let build_id = BuildId::from(7);
+
+        progress.task_finished(
+            build_id,
+            &build,
+            &TaskResult {
+                termination: Termination::Success,
+                output: b"diagnostic".to_vec(),
+                discovered_deps: None,
+            },
+        );
+
+        assert_eq!(*captured.lock().unwrap(), [(build_id, "diagnostic".into())]);
+    }
 
     #[test]
     fn progress_bar_rendering() {
