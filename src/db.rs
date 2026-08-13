@@ -180,18 +180,11 @@ impl Writer {
         ids: IdMap,
         graph: &Graph,
         plan: &CompactionPlan,
+        mut compacted: Vec<u8>,
     ) -> std::io::Result<Self> {
-        if plan.encoded_size > usize::MAX as u64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "compacted database does not fit in memory",
-            ));
-        }
-
         // Preserve database path IDs, then copy the latest raw build records
         // in their original order. Read everything before truncating so an I/O
         // error leaves the old database untouched.
-        let mut compacted = Vec::with_capacity(plan.encoded_size as usize);
         compacted.extend_from_slice(SIGNATURE);
         compacted.extend_from_slice(&VERSION.to_le_bytes());
         for &fileid in ids.fileids.iter() {
@@ -400,7 +393,26 @@ fn compact_if_needed(
         return Ok(Writer::from_opened(old_ids, file));
     }
 
-    let writer = Writer::rewrite_compacted(file, old_ids, graph, &plan)?;
+    if plan.encoded_size > usize::MAX as u64 {
+        tracing::warn!(
+            path = %path.display(),
+            compacted_size = plan.encoded_size,
+            "skipped database compaction because its buffer is too large"
+        );
+        return Ok(Writer::from_opened(old_ids, file));
+    }
+    let mut compacted = Vec::new();
+    if let Err(err) = compacted.try_reserve_exact(plan.encoded_size as usize) {
+        tracing::warn!(
+            path = %path.display(),
+            compacted_size = plan.encoded_size,
+            error = %err,
+            "skipped database compaction because its buffer could not be allocated"
+        );
+        return Ok(Writer::from_opened(old_ids, file));
+    }
+
+    let writer = Writer::rewrite_compacted(file, old_ids, graph, &plan, compacted)?;
     tracing::info!(
         path = %path.display(),
         old_size = valid_size,
