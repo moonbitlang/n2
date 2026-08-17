@@ -276,8 +276,12 @@ impl std::error::Error for OpenErrorKind {
 /// Replacement does not preserve the cache file's inode, hard links, ACLs, or
 /// extended attributes, and the containing directory is not synchronized.
 ///
-/// Callers sharing `path` must hold the same interprocess exclusive lock until
-/// the returned [`Writer`] is dropped.
+/// Callers sharing `path` must acquire the same interprocess exclusive lock
+/// before calling this function and hold it until the returned [`Writer`] is
+/// dropped. Without that coordination, compaction can replace the database
+/// while another writer still has the previous inode open. Writes through that
+/// old handle may succeed but will no longer be reachable through `path`,
+/// silently losing completed-build records.
 pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Writer, OpenError> {
     let span = tracing::info_span!("db.open", path = %path.display());
     let _enter = span.enter();
