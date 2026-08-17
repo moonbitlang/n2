@@ -1,20 +1,20 @@
 //! The n2 database stores information about previous builds for determining
 //! which files are up to date.
 
+mod record;
+
 use crate::{
     densemap, densemap::DenseMap, graph::BuildId, graph::FileId, graph::Graph, graph::Hashes,
     hash::BuildHash,
 };
-use anyhow::bail;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
-use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
 const VERSION: u32 = 1;
+const SIGNATURE: &[u8; 4] = b"n2db";
 
 /// Files are identified by integers that are stable across n2 executions.
 #[derive(Debug, Clone, Copy)]
@@ -99,7 +99,7 @@ impl Writer {
     }
 
     fn write_signature(&mut self) -> std::io::Result<()> {
-        self.w.write_all("n2db".as_bytes())?;
+        self.w.write_all(SIGNATURE)?;
         self.w.write_all(&u32::to_le_bytes(VERSION))
     }
 
@@ -163,145 +163,74 @@ impl Writer {
 }
 
 struct Reader<'a> {
-    r: BufReader<&'a mut File>,
+    records: record::Records<&'a mut File>,
     ids: IdMap,
     graph: &'a mut Graph,
     hashes: &'a mut Hashes,
 }
 
 impl<'a> Reader<'a> {
-    fn read_u16(&mut self) -> std::io::Result<u16> {
-        let mut buf: [u8; 2] = [0; 2];
-        self.r.read_exact(&mut buf[..])?;
-        Ok(u16::from_le_bytes(buf))
-    }
-
-    fn read_u24(&mut self) -> std::io::Result<u32> {
-        let mut buf: [u8; 4] = [0; 4];
-        self.r.read_exact(&mut buf[..3])?;
-        Ok(u32::from_le_bytes(buf))
-    }
-
-    fn read_u64(&mut self) -> std::io::Result<u64> {
-        let mut buf: [u8; 8] = [0; 8];
-        self.r.read_exact(&mut buf)?;
-        Ok(u64::from_le_bytes(buf))
-    }
-
-    fn read_id(&mut self) -> std::io::Result<Id> {
-        self.read_u24().map(Id)
-    }
-
-    fn read_str(&mut self, len: usize) -> std::io::Result<String> {
-        let mut buf = vec![0; len];
-        self.r.read_exact(buf.as_mut_slice())?;
-        Ok(unsafe { String::from_utf8_unchecked(buf) })
-    }
-
-    fn read_path(&mut self, len: usize) -> std::io::Result<()> {
-        let name = self.read_str(len)?;
-        // No canonicalization needed, paths were written canonicalized.
-        let fileid = self.graph.files.id_from_canonical(name);
-        let dbid = self.ids.fileids.push(fileid);
-        self.ids.db_ids.insert(fileid, dbid);
-        Ok(())
-    }
-
-    fn read_build(&mut self, len: usize) -> std::io::Result<()> {
-        // This record logs a build.  We expect all the outputs to be
-        // outputs of the same build id; if not, that means the graph has
-        // changed since this log, in which case we just ignore it.
-        //
-        // It's possible we log a build that generates files A B, then
-        // change the build file such that it only generates file A; this
-        // logic will still attach the old dependencies to A, but it
-        // shouldn't matter because the changed command line will cause us
-        // to rebuild A regardless, and these dependencies are only used
-        // to affect dirty checking, not build order.
-
+    fn read_build(&mut self, build: record::BuildLayout) {
+        let bytes = self.records.bytes();
         let mut unique_bid = None;
         let mut obsolete = false;
-        for _ in 0..len {
-            let fileid = self.read_id()?;
+        for raw_id in build.outputs(bytes) {
             if obsolete {
-                // Even though we know we don't want this record, we must
-                // keep reading to parse through it.
                 continue;
             }
-            match self.graph.file(self.ids.fileids[fileid]).input {
-                None => {
-                    obsolete = true;
-                }
-                Some(bid) => {
-                    match unique_bid {
-                        None => unique_bid = Some(bid),
-                        Some(unique_bid) if unique_bid == bid => {
-                            // Ok, matches the existing id.
-                        }
-                        Some(_) => {
-                            // Mismatch.
-                            unique_bid = None;
-                            obsolete = true;
-                        }
+            match self.graph.file(self.ids.fileids[Id(raw_id)]).input {
+                None => obsolete = true,
+                Some(id) => match unique_bid {
+                    None => unique_bid = Some(id),
+                    Some(unique) if unique == id => {}
+                    Some(_) => {
+                        unique_bid = None;
+                        obsolete = true;
                     }
-                }
+                },
             }
         }
 
-        let len = self.read_u16()?;
         let mut deps = Vec::new();
-        for _ in 0..len {
-            let id = self.read_id()?;
-            deps.push(self.ids.fileids[id]);
+        for raw_id in build.dependencies(bytes) {
+            deps.push(self.ids.fileids[Id(raw_id)]);
         }
+        let hash = BuildHash(build.hash(bytes));
 
-        let hash = BuildHash(self.read_u64()?);
-
-        // unique_bid is set here if this record is valid.
         if let Some(id) = unique_bid {
-            // Common case: only one associated build.
             self.graph.builds[id].set_discovered_ins(deps);
             self.hashes.set(id, hash);
         }
-        Ok(())
-    }
-
-    fn read_signature(&mut self) -> anyhow::Result<()> {
-        let mut buf: [u8; 4] = [0; 4];
-        self.r.read_exact(&mut buf[..])?;
-        if buf.as_slice() != "n2db".as_bytes() {
-            bail!("invalid db signature");
-        }
-        self.r.read_exact(&mut buf[..])?;
-        let version = u32::from_le_bytes(buf);
-        if version != VERSION {
-            bail!("db version mismatch: got {version}, expected {VERSION}; TODO: db upgrades etc");
-        }
-        Ok(())
     }
 
     fn read_file(&mut self) -> anyhow::Result<()> {
         let span = tracing::info_span!("db.read_file");
         let _enter = span.enter();
 
-        self.read_signature()?;
         loop {
-            let mut len = match self.read_u16() {
-                Ok(r) => r,
-                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => bail!(err),
-            };
-            let mask = 0b1000_0000_0000_0000;
-            if len & mask == 0 {
-                let _path_span =
-                    tracing::info_span!("db.read_path_record", name_len = (len as usize)).entered();
-                self.read_path(len as usize)?;
-            } else {
-                let outs_len = (len & !mask) as usize;
-                let _build_span =
-                    tracing::info_span!("db.read_build_record", outs_len = outs_len).entered();
-                len &= !mask;
-                self.read_build(len as usize)?;
+            if !self.records.next()? {
+                break;
+            }
+            let kind = self.records.kind();
+            match kind {
+                record::Kind::Path(path) => {
+                    let _path_span =
+                        tracing::info_span!("db.read_path_record", name_len = path.name_len)
+                            .entered();
+                    let name = path.name(self.records.bytes()).to_vec();
+                    let name = unsafe { String::from_utf8_unchecked(name) };
+                    // No canonicalization needed; paths were canonicalized
+                    // before they were written.
+                    let fileid = self.graph.files.id_from_canonical(name);
+                    let dbid = self.ids.fileids.push(fileid);
+                    self.ids.db_ids.insert(fileid, dbid);
+                }
+                record::Kind::Build(build) => {
+                    let _build_span =
+                        tracing::info_span!("db.read_build_record", outs_len = build.outputs_len)
+                            .entered();
+                    self.read_build(build);
+                }
             }
         }
         Ok(())
@@ -309,14 +238,14 @@ impl<'a> Reader<'a> {
 
     /// Reads an on-disk database, loading its state into the provided Graph/Hashes.
     fn read(f: &mut File, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Result<IdMap> {
+        let records = record::Records::new(f)?;
         let mut r = Reader {
-            r: std::io::BufReader::new(f),
+            records,
             ids: IdMap::default(),
             graph,
             hashes,
         };
         r.read_file()?;
-
         Ok(r.ids)
     }
 }
