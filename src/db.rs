@@ -1,6 +1,7 @@
 //! The n2 database stores information about previous builds for determining
 //! which files are up to date.
 
+mod compaction;
 mod history;
 mod record;
 
@@ -90,7 +91,10 @@ pub struct Writer {
 
 impl Writer {
     fn create(path: &Path) -> std::io::Result<Self> {
-        let f = std::fs::File::create(path)?;
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(path)?;
         let mut w = Self::from_opened(IdMap::default(), f);
         w.write_signature()?;
         Ok(w)
@@ -183,10 +187,16 @@ struct Replay {
     ids: IdMap,
     history: BuildHistory,
     pending: DenseMap<BuildId, Option<PendingBuild>>,
+    ended_at_record_boundary: bool,
 }
 
 impl Replay {
-    fn commit(mut self, graph: &mut Graph, hashes: &mut Hashes) -> IdMap {
+    fn commit(
+        mut self,
+        replacement_ids: Option<IdMap>,
+        graph: &mut Graph,
+        hashes: &mut Hashes,
+    ) -> IdMap {
         for index in 0..graph.builds.iter().len() {
             let id = BuildId::from(index);
             let Some(pending) = self.pending[id].take() else {
@@ -197,7 +207,7 @@ impl Replay {
                 hashes.set(id, pending.hash);
             }
         }
-        self.ids
+        replacement_ids.unwrap_or(self.ids)
     }
 }
 
@@ -276,7 +286,8 @@ impl<'a> Reader<'a> {
 
     /// Replays an on-disk database without committing matched build state.
     fn read(f: &mut File, graph: &mut Graph) -> anyhow::Result<Replay> {
-        let records = record::Records::new(f)?;
+        let end = f.metadata()?.len();
+        let records = record::Records::new(f, end)?;
         let pending = DenseMap::new_sized(graph.builds.next_id(), None);
         let mut r = Reader {
             records,
@@ -290,6 +301,7 @@ impl<'a> Reader<'a> {
             ids: r.ids,
             history: r.history,
             pending: r.pending,
+            ended_at_record_boundary: r.records.ended_at_record_boundary(),
         })
     }
 }
@@ -342,50 +354,99 @@ impl std::error::Error for OpenErrorKind {
 /// Opens or creates an on-disk database, loading its state into the provided Graph.
 ///
 /// Ordinary replay also gathers database-global output ownership: a later
-/// build record invalidates every earlier record sharing any output. The
-/// current graph is used only to select cached state to load, never to decide
-/// which database-global record is authoritative.
+/// build record invalidates every earlier record sharing any output. If a
+/// database is at least 2 MiB and the remaining records and paths fit in one
+/// third of the current log, opening performs best-effort mechanical
+/// compaction before opening the append handle. The current graph is never
+/// used to decide which persistent records are live. Compaction streams the
+/// retained state to a temporary file and replaces the cache only after the
+/// staged file contents have been synchronized. A log that does not end at a
+/// complete record boundary is left unchanged; recovery is a separate policy.
+/// The database is a reconstructible cache: replacement does not preserve its
+/// inode, hard links, custom permissions, ACLs, or extended attributes. The
+/// containing directory is not synchronized, so a system crash may lose the
+/// cache entry.
 ///
 /// Graphs sharing `path` must be disjoint portions of one logical graph. Each
 /// Build must appear with its complete output list, and an output must not have
 /// multiple producers across those portions.
+///
+/// Before calling this function, the caller must acquire the same interprocess
+/// exclusive lock used by every consumer of `path`, and hold it until the
+/// returned [`Writer`] is dropped.
 pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Writer, OpenError> {
     let span = tracing::info_span!("db.open", path = %path.display());
     let _enter = span.enter();
 
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .open(path)
-    {
-        Ok(mut f) => {
-            let _branch = tracing::info_span!("db.open_existing").entered();
-            tracing::info!(path = %path.display(), "opening existing database");
-            let replay = {
-                let _read = tracing::info_span!("db.read").entered();
-                Reader::read(&mut f, graph).map_err(|err| OpenError {
-                    path: path.to_path_buf(),
-                    source: OpenErrorKind::ReadDB(err),
-                })?
-            };
-            let ids = replay.commit(graph, hashes);
-            tracing::info!(path = %path.display(), "database loaded successfully");
-            Ok(Writer::from_opened(ids, f))
-        }
+    // A library process may change its process-wide working directory from a
+    // different thread. Resolve a relative database name once so compaction,
+    // replay, and append all select the file protected by the caller's lock.
+    let stable_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .map_err(|err| OpenError {
+                path: path.to_path_buf(),
+                source: OpenErrorKind::OpenDB(err),
+            })?
+    };
+    let mut source = match File::open(&stable_path) {
+        Ok(source) => source,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let _create = tracing::info_span!("db.create").entered();
             tracing::info!(path = %path.display(), "creating new database");
-            let w = Writer::create(path).map_err(|err| OpenError {
+            return Writer::create(&stable_path).map_err(|err| OpenError {
                 path: path.to_path_buf(),
                 source: OpenErrorKind::CreateDB(err),
-            })?;
-            Ok(w)
+            });
         }
-        Err(err) => Err(OpenError {
+        Err(err) => {
+            return Err(OpenError {
+                path: path.to_path_buf(),
+                source: OpenErrorKind::OpenDB(err),
+            })
+        }
+    };
+
+    let _branch = tracing::info_span!("db.open_existing").entered();
+    tracing::info!(path = %path.display(), "opening existing database");
+    let old_size = source
+        .metadata()
+        .map_err(|err| OpenError {
             path: path.to_path_buf(),
             source: OpenErrorKind::OpenDB(err),
-        }),
-    }
+        })?
+        .len();
+    let replay = {
+        let _read = tracing::info_span!("db.read").entered();
+        Reader::read(&mut source, graph).map_err(|err| OpenError {
+            path: path.to_path_buf(),
+            source: OpenErrorKind::ReadDB(err),
+        })?
+    };
+    drop(source);
+
+    let replacement_ids = compaction::compact_if_needed(
+        &stable_path,
+        graph,
+        &replay.ids,
+        &replay.history,
+        replay.ended_at_record_boundary,
+        old_size,
+    );
+    let w = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&stable_path)
+        .map_err(|err| OpenError {
+            path: path.to_path_buf(),
+            source: OpenErrorKind::OpenDB(err),
+        })?;
+    // Do not mutate the caller's build state unless opening for append also
+    // succeeded: a successful return is the transaction boundary of open().
+    let ids = replay.commit(replacement_ids, graph, hashes);
+    tracing::info!(path = %path.display(), "database loaded successfully");
+    Ok(Writer::from_opened(ids, w))
 }
 
 #[cfg(test)]

@@ -38,6 +38,13 @@ impl<K: Index, V> std::ops::IndexMut<K> for DenseMap<K, V> {
 }
 
 impl<K: Index, V> DenseMap<K, V> {
+    pub(crate) fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.vec.try_reserve(additional)
+    }
+
     pub fn lookup(&self, k: K) -> Option<&V> {
         self.vec.get(k.index())
     }
