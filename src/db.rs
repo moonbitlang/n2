@@ -1,12 +1,14 @@
 //! The n2 database stores information about previous builds for determining
 //! which files are up to date.
 
+mod history;
 mod record;
 
 use crate::{
     densemap, densemap::DenseMap, graph::BuildId, graph::FileId, graph::Graph, graph::Hashes,
     hash::BuildHash,
 };
+use history::{BuildHistory, RecordId};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -165,42 +167,77 @@ impl Writer {
 struct Reader<'a> {
     records: record::Records<&'a mut File>,
     ids: IdMap,
+    history: BuildHistory,
+    pending: DenseMap<BuildId, Option<PendingBuild>>,
     graph: &'a mut Graph,
-    hashes: &'a mut Hashes,
+}
+
+#[derive(Clone)]
+struct PendingBuild {
+    record: RecordId,
+    deps: Vec<FileId>,
+    hash: BuildHash,
+}
+
+struct Replay {
+    ids: IdMap,
+    history: BuildHistory,
+    pending: DenseMap<BuildId, Option<PendingBuild>>,
+}
+
+impl Replay {
+    fn commit(mut self, graph: &mut Graph, hashes: &mut Hashes) -> IdMap {
+        for index in 0..graph.builds.iter().len() {
+            let id = BuildId::from(index);
+            let Some(pending) = self.pending[id].take() else {
+                continue;
+            };
+            if self.history.is_live(pending.record) {
+                graph.builds[id].set_discovered_ins(pending.deps);
+                hashes.set(id, pending.hash);
+            }
+        }
+        self.ids
+    }
 }
 
 impl<'a> Reader<'a> {
-    fn read_build(&mut self, build: record::BuildLayout) {
+    fn lookup_file(&self, raw_id: u32) -> FileId {
+        self.ids.fileids[Id(raw_id)]
+    }
+
+    fn matching_build(&self, build: record::BuildLayout) -> Option<BuildId> {
         let bytes = self.records.bytes();
-        let mut unique_bid = None;
-        let mut obsolete = false;
-        for raw_id in build.outputs(bytes) {
-            if obsolete {
-                continue;
-            }
-            match self.graph.file(self.ids.fileids[Id(raw_id)]).input {
-                None => obsolete = true,
-                Some(id) => match unique_bid {
-                    None => unique_bid = Some(id),
-                    Some(unique) if unique == id => {}
-                    Some(_) => {
-                        unique_bid = None;
-                        obsolete = true;
-                    }
-                },
+        let Some(first) = build.outputs(bytes).next() else {
+            return None;
+        };
+        let Some(id) = self.graph.file(self.lookup_file(first)).input else {
+            return None;
+        };
+        let current_outputs = self.graph.builds[id].outs();
+        if current_outputs.len() != build.outputs_len {
+            return None;
+        }
+        for (raw_id, &current) in build.outputs(bytes).zip(current_outputs) {
+            if self.lookup_file(raw_id) != current {
+                return None;
             }
         }
+        Some(id)
+    }
 
+    fn read_build(&mut self, build: record::BuildLayout) {
+        let record = self.history.record_build(build, self.records.bytes());
         let mut deps = Vec::new();
-        for raw_id in build.dependencies(bytes) {
-            deps.push(self.ids.fileids[Id(raw_id)]);
+        for raw_id in build.dependencies(self.records.bytes()) {
+            deps.push(self.lookup_file(raw_id));
         }
-        let hash = BuildHash(build.hash(bytes));
+        let Some(id) = self.matching_build(build) else {
+            return;
+        };
 
-        if let Some(id) = unique_bid {
-            self.graph.builds[id].set_discovered_ins(deps);
-            self.hashes.set(id, hash);
-        }
+        let hash = BuildHash(build.hash(self.records.bytes()));
+        self.pending[id] = Some(PendingBuild { record, deps, hash });
     }
 
     fn read_file(&mut self) -> anyhow::Result<()> {
@@ -224,6 +261,7 @@ impl<'a> Reader<'a> {
                     let fileid = self.graph.files.id_from_canonical(name);
                     let dbid = self.ids.fileids.push(fileid);
                     self.ids.db_ids.insert(fileid, dbid);
+                    self.history.record_path();
                 }
                 record::Kind::Build(build) => {
                     let _build_span =
@@ -236,17 +274,23 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    /// Reads an on-disk database, loading its state into the provided Graph/Hashes.
-    fn read(f: &mut File, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Result<IdMap> {
+    /// Replays an on-disk database without committing matched build state.
+    fn read(f: &mut File, graph: &mut Graph) -> anyhow::Result<Replay> {
         let records = record::Records::new(f)?;
+        let pending = DenseMap::new_sized(graph.builds.next_id(), None);
         let mut r = Reader {
             records,
             ids: IdMap::default(),
+            history: BuildHistory::default(),
+            pending,
             graph,
-            hashes,
         };
         r.read_file()?;
-        Ok(r.ids)
+        Ok(Replay {
+            ids: r.ids,
+            history: r.history,
+            pending: r.pending,
+        })
     }
 }
 
@@ -296,6 +340,15 @@ impl std::error::Error for OpenErrorKind {
 }
 
 /// Opens or creates an on-disk database, loading its state into the provided Graph.
+///
+/// Ordinary replay also gathers database-global output ownership: a later
+/// build record invalidates every earlier record sharing any output. The
+/// current graph is used only to select cached state to load, never to decide
+/// which database-global record is authoritative.
+///
+/// Graphs sharing `path` must be disjoint portions of one logical graph. Each
+/// Build must appear with its complete output list, and an output must not have
+/// multiple producers across those portions.
 pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Writer, OpenError> {
     let span = tracing::info_span!("db.open", path = %path.display());
     let _enter = span.enter();
@@ -308,13 +361,14 @@ pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Write
         Ok(mut f) => {
             let _branch = tracing::info_span!("db.open_existing").entered();
             tracing::info!(path = %path.display(), "opening existing database");
-            let ids = {
+            let replay = {
                 let _read = tracing::info_span!("db.read").entered();
-                Reader::read(&mut f, graph, hashes).map_err(|err| OpenError {
+                Reader::read(&mut f, graph).map_err(|err| OpenError {
                     path: path.to_path_buf(),
                     source: OpenErrorKind::ReadDB(err),
                 })?
             };
+            let ids = replay.commit(graph, hashes);
             tracing::info!(path = %path.display(), "database loaded successfully");
             Ok(Writer::from_opened(ids, f))
         }
@@ -340,6 +394,9 @@ mod tests {
 
     const OUT_ONLY: &[u8] = b"build out: phony\n";
     const OUT_AND_OTHER: &[u8] = b"build out: phony\nbuild other-out: phony\n";
+    const A_ONLY: &[u8] = b"build a: phony\n";
+    const B_ONLY: &[u8] = b"build b: phony\n";
+    const A_AND_B: &[u8] = b"build a b: phony\n";
 
     fn build_graph(manifest: &[u8], dep_count: usize) -> anyhow::Result<(Graph, BuildId)> {
         let mut graph = crate::load::parse("build.ninja", manifest.to_vec())?;
@@ -352,6 +409,16 @@ mod tests {
             .collect();
         graph.builds[id].set_discovered_ins(deps);
         Ok((graph, id))
+    }
+
+    fn append_build_record(path: &Path, outputs: &[u32], hash: u64) -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.write_all(&(0x8000 | outputs.len() as u16).to_le_bytes())?;
+        for output in outputs {
+            file.write_all(&output.to_le_bytes()[..3])?;
+        }
+        file.write_all(&0u16.to_le_bytes())?;
+        file.write_all(&hash.to_le_bytes())
     }
 
     #[test]
@@ -388,6 +455,65 @@ mod tests {
         let writer = open(&path, &mut graph, &mut hashes)?;
 
         assert_eq!(hashes.get(other_id), Some(BuildHash(123)));
+        drop(writer);
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_output_invalidates_the_whole_prior_record() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(".n2_db");
+        let mut graph = crate::load::parse("build.ninja", A_AND_B.to_vec())?;
+        let joint_id = graph.file(graph.files.lookup("a").unwrap()).input.unwrap();
+        let mut writer = open(&path, &mut graph, &mut Hashes::default())?;
+        writer.write_build(&graph, joint_id, BuildHash(1))?;
+        drop(writer);
+
+        // Path ID 0 is `a`. Its newer ownership invalidates the complete
+        // earlier [a, b] record, even though b is not mentioned again.
+        append_build_record(&path, &[0], 2)?;
+
+        let mut graph = crate::load::parse("build.ninja", A_AND_B.to_vec())?;
+        let joint_id = graph.file(graph.files.lookup("a").unwrap()).input.unwrap();
+        let mut hashes = Hashes::default();
+        let writer = open(&path, &mut graph, &mut hashes)?;
+        assert_eq!(hashes.get(joint_id), None);
+        drop(writer);
+
+        let mut graph = crate::load::parse("build.ninja", A_ONLY.to_vec())?;
+        let a_id = graph.file(graph.files.lookup("a").unwrap()).input.unwrap();
+        let mut hashes = Hashes::default();
+        let writer = open(&path, &mut graph, &mut hashes)?;
+        assert_eq!(hashes.get(a_id), Some(BuildHash(2)));
+        drop(writer);
+        Ok(())
+    }
+
+    #[test]
+    fn split_outputs_acquire_independent_latest_records() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(".n2_db");
+        let mut graph = crate::load::parse("build.ninja", A_AND_B.to_vec())?;
+        let joint_id = graph.file(graph.files.lookup("a").unwrap()).input.unwrap();
+        let mut writer = open(&path, &mut graph, &mut Hashes::default())?;
+        writer.write_build(&graph, joint_id, BuildHash(1))?;
+        drop(writer);
+
+        append_build_record(&path, &[0], 2)?;
+        append_build_record(&path, &[1], 3)?;
+
+        let mut graph = crate::load::parse("build.ninja", A_ONLY.to_vec())?;
+        let a_id = graph.file(graph.files.lookup("a").unwrap()).input.unwrap();
+        let mut hashes = Hashes::default();
+        let writer = open(&path, &mut graph, &mut hashes)?;
+        assert_eq!(hashes.get(a_id), Some(BuildHash(2)));
+        drop(writer);
+
+        let mut graph = crate::load::parse("build.ninja", B_ONLY.to_vec())?;
+        let b_id = graph.file(graph.files.lookup("b").unwrap()).input.unwrap();
+        let mut hashes = Hashes::default();
+        let writer = open(&path, &mut graph, &mut hashes)?;
+        assert_eq!(hashes.get(b_id), Some(BuildHash(3)));
         drop(writer);
         Ok(())
     }
