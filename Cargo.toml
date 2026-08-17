@@ -20,6 +20,7 @@ argh = "0.1.10"
 colored = "2.1.0"
 libc = "0.2"
 rustc-hash = "1.1.0"
+tempfile = "3.6.0"
 tracing = "0.1.41"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
@@ -37,7 +38,6 @@ features = [
 jemallocator = { version = "0.5", optional = true }
 
 [dev-dependencies]
-tempfile = "3.6.0"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 
 [profile.release]
