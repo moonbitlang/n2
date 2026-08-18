@@ -1,6 +1,8 @@
 //! The n2 database stores information about previous builds for determining
 //! which files are up to date.
 
+mod compaction;
+mod history;
 mod record;
 
 use crate::{
@@ -263,6 +265,23 @@ impl std::error::Error for OpenErrorKind {
 }
 
 /// Opens or creates an on-disk database, loading its state into the provided Graph.
+///
+/// Large logs are compacted when removing superseded build records makes them
+/// fit in one third of their current size. A later complete build record
+/// supersedes every earlier record sharing any output. All path records and
+/// path IDs are preserved.
+///
+/// Compaction writes and synchronizes a temporary file before replacement and
+/// may discard a tolerated incomplete record header at the end of the log.
+/// Replacement does not preserve the cache file's inode, hard links, ACLs, or
+/// extended attributes, and the containing directory is not synchronized.
+///
+/// Callers sharing `path` must acquire the same interprocess exclusive lock
+/// before calling this function and hold it until the returned [`Writer`] is
+/// dropped. Without that coordination, compaction can replace the database
+/// while another writer still has the previous inode open. Writes through that
+/// old handle may succeed but will no longer be reachable through `path`,
+/// silently losing completed-build records.
 pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Writer, OpenError> {
     let span = tracing::info_span!("db.open", path = %path.display());
     let _enter = span.enter();
@@ -275,6 +294,13 @@ pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Write
         Ok(mut f) => {
             let _branch = tracing::info_span!("db.open_existing").entered();
             tracing::info!(path = %path.display(), "opening existing database");
+            let old_size = f
+                .metadata()
+                .map_err(|err| OpenError {
+                    path: path.to_path_buf(),
+                    source: OpenErrorKind::OpenDB(err),
+                })?
+                .len();
             let ids = {
                 let _read = tracing::info_span!("db.read").entered();
                 Reader::read(&mut f, graph, hashes).map_err(|err| OpenError {
@@ -282,6 +308,10 @@ pub fn open(path: &Path, graph: &mut Graph, hashes: &mut Hashes) -> Result<Write
                     source: OpenErrorKind::ReadDB(err),
                 })?
             };
+            let f = compaction::compact_if_needed(path, f, old_size).map_err(|err| OpenError {
+                path: path.to_path_buf(),
+                source: OpenErrorKind::OpenDB(err),
+            })?;
             tracing::info!(path = %path.display(), "database loaded successfully");
             Ok(Writer::from_opened(ids, f))
         }
@@ -336,9 +366,8 @@ mod tests {
             writer.write_build(&graph, id, BuildHash(hash))?;
         }
         drop(writer);
-        // Keep the fixture above the threshold used by the reverted automatic
-        // compaction so reintroducing it unsafely makes this test fail.
-        assert!(std::fs::metadata(&path)?.len() >= 2 * 1024 * 1024);
+        // Keep the fixture above the automatic compaction threshold.
+        assert!(std::fs::metadata(&path)?.len() >= compaction::MIN_COMPACTION_SIZE);
 
         // Opening a shared database with one invocation's partial graph must
         // not erase records owned by another invocation.

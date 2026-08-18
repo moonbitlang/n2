@@ -8,6 +8,7 @@ const SIGNATURE: &[u8] = b"n2db";
 const VERSION: u32 = 1;
 const BUILD_MARK: u16 = 0x8000;
 const PATH_ID_SIZE: usize = 3;
+pub(super) const DATABASE_HEADER_SIZE: u64 = (SIGNATURE.len() + size_of::<u32>()) as u64;
 
 #[derive(Debug)]
 pub(super) enum Record<'a, R> {
@@ -24,10 +25,15 @@ pub(super) struct BuildRecord<'a, R> {
     reader: &'a mut Reader<R>,
     outputs_len: usize,
     outputs_remaining: usize,
+    dependencies_len: Option<usize>,
     dependencies_remaining: Option<usize>,
 }
 
 impl PathRecord {
+    pub(super) fn encoded_len(&self) -> usize {
+        size_of::<u16>() + self.name.len()
+    }
+
     pub(super) fn into_name(self) -> String {
         self.name
     }
@@ -38,6 +44,7 @@ impl<R> std::fmt::Debug for BuildRecord<'_, R> {
         f.debug_struct("BuildRecord")
             .field("outputs_len", &self.outputs_len)
             .field("outputs_remaining", &self.outputs_remaining)
+            .field("dependencies_len", &self.dependencies_len)
             .field("dependencies_remaining", &self.dependencies_remaining)
             .finish()
     }
@@ -50,7 +57,7 @@ impl<R: Read> BuildRecord<'_, R> {
 
     pub(super) fn outputs(&mut self) -> impl ExactSizeIterator<Item = std::io::Result<Id>> + '_ {
         assert!(
-            self.dependencies_remaining.is_none(),
+            self.dependencies_len.is_none(),
             "outputs read after dependencies"
         );
         Ids {
@@ -64,14 +71,27 @@ impl<R: Read> BuildRecord<'_, R> {
     ) -> std::io::Result<impl ExactSizeIterator<Item = std::io::Result<Id>> + '_> {
         assert_eq!(self.outputs_remaining, 0, "dependencies before outputs");
         assert!(
-            self.dependencies_remaining.is_none(),
+            self.dependencies_len.is_none(),
             "dependencies read more than once"
         );
-        self.dependencies_remaining = Some(usize::from(self.reader.read_u16()?));
+        let dependencies_len = usize::from(self.reader.read_u16()?);
+        self.dependencies_len = Some(dependencies_len);
+        self.dependencies_remaining = Some(dependencies_len);
         Ok(Ids {
             reader: &mut *self.reader,
             remaining: self.dependencies_remaining.as_mut().unwrap(),
         })
+    }
+
+    pub(super) fn encoded_len(&self) -> usize {
+        let dependencies_len = self
+            .dependencies_len
+            .expect("dependencies must be started before measuring a build record");
+        size_of::<u16>()
+            + self.outputs_len * PATH_ID_SIZE
+            + size_of::<u16>()
+            + dependencies_len * PATH_ID_SIZE
+            + size_of::<u64>()
     }
 
     pub(super) fn hash(self) -> std::io::Result<u64> {
@@ -82,6 +102,33 @@ impl<R: Read> BuildRecord<'_, R> {
             "hash before dependencies"
         );
         self.reader.read_u64()
+    }
+
+    pub(super) fn skip(mut self) -> std::io::Result<()> {
+        for id in self.outputs() {
+            id?;
+        }
+        for id in self.dependencies()? {
+            id?;
+        }
+        self.hash().map(|_| ())
+    }
+
+    /// Streams this record to `target` without materializing it in memory.
+    pub(super) fn write_to(mut self, target: &mut impl Write) -> std::io::Result<()> {
+        target.write_all(&((self.outputs_len as u16) | BUILD_MARK).to_le_bytes())?;
+        for id in self.outputs() {
+            let id = id?;
+            target.write_all(&encode_id(id)[..PATH_ID_SIZE])?;
+        }
+
+        let dependencies = self.dependencies()?;
+        target.write_all(&(dependencies.len() as u16).to_le_bytes())?;
+        for id in dependencies {
+            let id = id?;
+            target.write_all(&encode_id(id)[..PATH_ID_SIZE])?;
+        }
+        target.write_all(&self.hash()?.to_le_bytes())
     }
 }
 
@@ -149,9 +196,9 @@ impl<R: Read> Reader<R> {
         match self.source.read_exact(&mut header) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // TODO: `read_exact` does not distinguish a clean end from a
-                // one-byte partial record header. Replay historically accepts
-                // both as the end of the append-only log.
+                // Replay historically accepts both a clean end and a partial
+                // record header as the end of the append-only log. Compaction
+                // may normalize the latter by omitting the incomplete tail.
                 return Ok(None);
             }
             Err(err) => return Err(err),
@@ -172,6 +219,7 @@ impl<R: Read> Reader<R> {
                 reader: self,
                 outputs_len,
                 outputs_remaining: outputs_len,
+                dependencies_len: None,
                 dependencies_remaining: None,
             })))
         }
@@ -273,10 +321,14 @@ fn write_u16(target: &mut Vec<u8>, value: u16) {
 }
 
 fn write_id(target: &mut Vec<u8>, id: Id) {
+    target.extend_from_slice(&encode_id(id)[..PATH_ID_SIZE]);
+}
+
+fn encode_id(id: Id) -> [u8; size_of::<u32>()] {
     if id.0 > (1 << (PATH_ID_SIZE * u8::BITS as usize)) {
         panic!("too many fileids");
     }
-    target.extend_from_slice(&id.0.to_le_bytes()[..PATH_ID_SIZE]);
+    id.0.to_le_bytes()
 }
 
 #[cfg(test)]
