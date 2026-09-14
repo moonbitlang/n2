@@ -7,6 +7,7 @@ mod eval;
 pub mod graph;
 mod hash;
 pub mod load;
+mod output;
 pub mod parse;
 mod process;
 #[cfg(unix)]
