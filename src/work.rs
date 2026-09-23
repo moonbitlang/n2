@@ -1036,7 +1036,7 @@ build c: phony a
             adopt: false,
             dirty_on_output: false,
         };
-        let mut progress = progress::DumbConsoleProgress::new(false, Some(Box::new(|_| {})));
+        let mut progress = progress::DumbConsoleProgress::new(false, Some(Box::new(|_, _, _| {})));
         let mut work = Work::new(
             graph.clone(),
             hashes,
