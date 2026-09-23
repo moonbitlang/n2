@@ -16,7 +16,7 @@ pub fn run_command(
     anyhow::bail!("wasm cannot run commands");
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Termination {
     Success,
     Interrupted,

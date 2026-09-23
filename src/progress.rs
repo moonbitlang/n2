@@ -1,9 +1,10 @@
 //! Build progress tracking and reporting, for the purpose of display to the
 //! user.
 
+pub use crate::process::Termination;
 use crate::{
-    graph::Build, graph::BuildId, output::OutputDecoder, process::Termination, task::TaskResult,
-    terminal, work::BuildState, work::StateCounts,
+    graph::Build, graph::BuildId, output::OutputDecoder, task::TaskResult, terminal,
+    work::BuildState, work::StateCounts,
 };
 use colored::*;
 use std::collections::VecDeque;
@@ -28,10 +29,14 @@ pub fn build_message(build: &Build, with_detail: bool) -> &str {
     }
 }
 
-/// Receives the complete output of one finished build task.
+/// Receives the termination status and decoded output of every finished task,
+/// including tasks with empty output.
 /// Text is decoded as UTF-8, with a best-effort console code page fallback on
 /// Windows. Invalid or unsupported encodings fall back to lossy UTF-8.
-pub type BuildOutputCallback = dyn Fn(BuildId, &str) + Send;
+///
+/// This callback owns failure and interruption reporting; the progress renderer
+/// does not also print those messages. It does not receive tasks that never ran.
+pub type BuildResultCallback = dyn Fn(BuildId, Termination, &str) + Send;
 
 /// Trait for build progress notifications.
 pub trait Progress {
@@ -76,22 +81,12 @@ pub struct DumbConsoleProgress {
     /// The id of the last command printed, used to avoid printing it twice
     /// when we have two updates from the same command in a row.
     last_started: Option<BuildId>,
-    callback: Option<Box<BuildOutputCallback>>,
+    callback: Option<Box<BuildResultCallback>>,
     decoder: OutputDecoder,
 }
 
 impl DumbConsoleProgress {
-    pub fn new(verbose: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
-        let callback = callback.map(|callback| {
-            Box::new(move |_, output: &str| callback(output)) as Box<BuildOutputCallback>
-        });
-        Self::new_with_build_output(verbose, callback)
-    }
-
-    pub fn new_with_build_output(
-        verbose: bool,
-        callback: Option<Box<BuildOutputCallback>>,
-    ) -> Self {
+    pub fn new(verbose: bool, callback: Option<Box<BuildResultCallback>>) -> Self {
         Self {
             verbose,
             last_started: None,
@@ -120,6 +115,10 @@ impl Progress for DumbConsoleProgress {
     }
 
     fn task_finished(&mut self, id: BuildId, build: &Build, result: &TaskResult) {
+        if let Some(callback) = &self.callback {
+            callback(id, result.termination, &self.decoder.decode(&result.output));
+            return;
+        }
         match result.termination {
             Termination::Success => {
                 // Common case: don't show anything.
@@ -137,12 +136,7 @@ impl Progress for DumbConsoleProgress {
             }
         };
         if !result.output.is_empty() {
-            if let Some(ref callback) = self.callback {
-                let msg = self.decoder.decode(&result.output);
-                callback(id, &msg);
-            } else {
-                std::io::stdout().write_all(&result.output).unwrap();
-            }
+            std::io::stdout().write_all(&result.output).unwrap();
         }
     }
 
@@ -173,17 +167,7 @@ pub struct FancyConsoleProgress {
 const UPDATE_DELAY: Duration = std::time::Duration::from_millis(50);
 
 impl FancyConsoleProgress {
-    pub fn new(verbose: bool, callback: Option<Box<dyn Fn(&str) + Send>>) -> Self {
-        let callback = callback.map(|callback| {
-            Box::new(move |_, output: &str| callback(output)) as Box<BuildOutputCallback>
-        });
-        Self::new_with_build_output(verbose, callback)
-    }
-
-    pub fn new_with_build_output(
-        verbose: bool,
-        callback: Option<Box<BuildOutputCallback>>,
-    ) -> Self {
+    pub fn new(verbose: bool, callback: Option<Box<BuildResultCallback>>) -> Self {
         let dirty_cond = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(FancyState {
             done: false,
@@ -290,7 +274,7 @@ struct FancyState {
     tasks: VecDeque<Task>,
     /// Whether to print command lines of started programs.
     verbose: bool,
-    callback: Option<Box<BuildOutputCallback>>,
+    callback: Option<Box<BuildResultCallback>>,
     decoder: OutputDecoder,
 }
 
@@ -329,6 +313,12 @@ impl FancyState {
         self.tasks
             .remove(self.tasks.iter().position(|t| t.id == id).unwrap());
 
+        if let Some(callback) = &self.callback {
+            self.clear_progress();
+            callback(id, result.termination, &self.decoder.decode(&result.output));
+            self.dirty();
+            return;
+        }
         match result.termination {
             Termination::Success => {
                 // Common case: don't show anything.
@@ -352,13 +342,7 @@ impl FancyState {
             }
         };
         if !result.output.is_empty() {
-            if let Some(ref callback) = self.callback {
-                self.clear_progress();
-                let msg = self.decoder.decode(&result.output);
-                callback(id, &msg);
-            } else {
-                std::io::stdout().write_all(&result.output).unwrap();
-            }
+            std::io::stdout().write_all(&result.output).unwrap();
         }
 
         // mark as dirty to trigger progress update
@@ -533,39 +517,16 @@ mod tests {
     }
 
     #[test]
-    fn completed_output_retains_build_id() {
+    fn completed_results_include_silent_tasks_and_termination() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&captured);
-        let mut progress = DumbConsoleProgress::new_with_build_output(
-            false,
-            Some(Box::new(move |id, content| {
-                output.lock().unwrap().push((id, content.to_owned()));
-            })),
-        );
-        let build = test_build();
-        let build_id = BuildId::from(7);
-
-        progress.task_finished(
-            build_id,
-            &build,
-            &TaskResult {
-                termination: Termination::Success,
-                output: b"diagnostic".to_vec(),
-                discovered_deps: None,
-            },
-        );
-
-        assert_eq!(*captured.lock().unwrap(), [(build_id, "diagnostic".into())]);
-    }
-
-    #[test]
-    fn completed_output_and_preview_use_the_same_decoding() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let output = Arc::clone(&captured);
-        let mut dumb = DumbConsoleProgress::new_with_build_output(
-            false,
-            Some(Box::new(move |id, content| {
-                output.lock().unwrap().push((id, content.to_owned()));
+        let mut dumb = DumbConsoleProgress::new(
+            true,
+            Some(Box::new(move |id, termination, content| {
+                output
+                    .lock()
+                    .unwrap()
+                    .push((id, termination, content.to_owned()));
             })),
         );
         let output = Arc::clone(&captured);
@@ -577,8 +538,11 @@ mod tests {
             counts: StateCounts::default(),
             tasks: VecDeque::new(),
             verbose: false,
-            callback: Some(Box::new(move |id, content| {
-                output.lock().unwrap().push((id, content.to_owned()));
+            callback: Some(Box::new(move |id, termination, content| {
+                output
+                    .lock()
+                    .unwrap()
+                    .push((id, termination, content.to_owned()));
             })),
             decoder: OutputDecoder::default(),
         };
@@ -589,34 +553,45 @@ mod tests {
         }
 
         let build = test_build();
-        let build_id = BuildId::from(7);
         let cases: &[(&[u8], &str)] = &[
-            (b"diagnostic", "diagnostic"),
+            (b"", ""),
+            (b"diagnostic\n", "diagnostic\n"),
             ("测试 é 😀".as_bytes(), "测试 é 😀"),
             #[cfg(windows)]
             (b"missing-\xb2\xe2\xca\xd4.obj", "missing-测试.obj"),
             (b"missing-\x81", "missing-�"),
         ];
-        for &(bytes, expected) in cases {
-            captured.lock().unwrap().clear();
-            fancy.task_started(build_id, &build);
-            fancy.task_output(build_id, bytes.to_vec());
-            assert_eq!(fancy.tasks[0].last_line.as_deref(), Some(expected));
-
-            let result = TaskResult {
-                termination: Termination::Success,
-                output: bytes.to_vec(),
-                discovered_deps: None,
-            };
-            dumb.task_finished(build_id, &build, &result);
-            fancy.task_finished(build_id, &build, &result);
-            assert_eq!(
-                *captured.lock().unwrap(),
-                [
-                    (build_id, expected.to_owned()),
-                    (build_id, expected.to_owned())
-                ]
-            );
+        for (index, termination) in [
+            Termination::Success,
+            Termination::Failure,
+            Termination::Interrupted,
+        ]
+        .iter()
+        .copied()
+        .enumerate()
+        {
+            let build_id = BuildId::from(index);
+            for &(bytes, expected) in cases {
+                captured.lock().unwrap().clear();
+                fancy.task_started(build_id, &build);
+                fancy.task_output(build_id, bytes.to_vec());
+                assert_eq!(fancy.tasks[0].last_line.as_deref(), Some(expected));
+                let result = TaskResult {
+                    termination,
+                    output: bytes.to_vec(),
+                    discovered_deps: None,
+                };
+                dumb.task_finished(build_id, &build, &result);
+                fancy.task_finished(build_id, &build, &result);
+                assert!(fancy.tasks.is_empty());
+                assert_eq!(
+                    *captured.lock().unwrap(),
+                    [
+                        (build_id, termination, expected.to_owned()),
+                        (build_id, termination, expected.to_owned()),
+                    ]
+                );
+            }
         }
     }
 
